@@ -1,5 +1,6 @@
 mod app;
 mod lock;
+mod progress;
 mod scan;
 mod store;
 mod sync;

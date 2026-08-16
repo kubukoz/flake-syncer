@@ -6,6 +6,7 @@
 //! the `original`: two flakes "declare the same input" when their `original`
 //! matches, and they diverge when the corresponding `locked.rev` differs.
 
+use crate::progress::Progress;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -174,8 +175,10 @@ pub fn parse(path: &Path) -> Result<LockFile> {
 pub fn group(lock_paths: &[PathBuf]) -> (Vec<Group>, Vec<(PathBuf, anyhow::Error)>) {
     let mut map: BTreeMap<Identity, Vec<Pin>> = BTreeMap::new();
     let mut errors = Vec::new();
+    let progress = Progress::new("parsing", Some(lock_paths.len()));
 
     for lock_path in lock_paths {
+        progress.advance(1);
         let lock = match parse(lock_path) {
             Ok(l) => l,
             Err(e) => {
@@ -205,6 +208,8 @@ pub fn group(lock_paths: &[PathBuf]) -> (Vec<Group>, Vec<(PathBuf, anyhow::Error
             });
         }
     }
+
+    progress.finish();
 
     let groups = map
         .into_iter()

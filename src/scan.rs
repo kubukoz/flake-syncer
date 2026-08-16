@@ -1,5 +1,6 @@
 //! Discovery of flake projects on disk, and the config that drives it.
 
+use crate::progress::Progress;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -59,7 +60,12 @@ pub fn load_config() -> Result<Config> {
 /// `.git` and `.direnv` are skipped: the latter contains materialized copies of
 /// flake inputs, whose own lockfiles are not projects the user maintains and
 /// would badly skew the divergence counts.
+///
+/// The walk cannot know how many directories it will visit before visiting
+/// them, so progress here is a running count of what has been found rather than
+/// a percentage.
 pub fn find_lockfiles(cfg: &Config) -> Vec<PathBuf> {
+    let progress = Progress::new("discovering", None);
     let mut out = Vec::new();
     for root in &cfg.roots {
         if !root.exists() {
@@ -77,10 +83,13 @@ pub fn find_lockfiles(cfg: &Config) -> Vec<PathBuf> {
         for entry in walker.filter_map(|e| e.ok()) {
             if entry.file_type().is_file() && entry.file_name() == "flake.lock" {
                 out.push(entry.into_path());
+                progress.advance(1);
             }
         }
     }
     out.sort();
     out.dedup();
+    progress.set(out.len());
+    progress.finish();
     out
 }

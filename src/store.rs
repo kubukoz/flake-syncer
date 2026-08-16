@@ -12,6 +12,7 @@
 //! we are not touching stays put, and reporting it as reclaimable would be a
 //! lie.
 
+use crate::progress::Progress;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -39,6 +40,7 @@ pub fn scan_roots() -> BTreeMap<PathBuf, RootedPath> {
         return BTreeMap::new();
     };
 
+    let links = Progress::new("gc roots", None);
     for entry in entries.filter_map(|e| e.ok()) {
         let Ok(target) = std::fs::read_link(entry.path()) else {
             continue;
@@ -62,10 +64,16 @@ pub fn scan_roots() -> BTreeMap<PathBuf, RootedPath> {
             .entry(real)
             .or_default()
             .insert(PathBuf::from(project));
+        links.advance(1);
     }
+    links.set(retainers.len());
+    links.finish();
 
     // Sizing dominates the scan (it walks every file of every rooted source),
-    // so each unique store path is measured once, in parallel.
+    // so each unique store path is measured once, in parallel. This is also the
+    // one phase slow enough to need an ETA, and the count is known up front, so
+    // the estimate is a real one.
+    let sizing = Progress::new("sizing paths", Some(retainers.len()));
     let sizes: Vec<(PathBuf, u64)> = retainers
         .keys()
         .cloned()
@@ -73,9 +81,11 @@ pub fn scan_roots() -> BTreeMap<PathBuf, RootedPath> {
         .into_par_iter()
         .map(|p| {
             let size = dir_size(&p);
+            sizing.advance(1);
             (p, size)
         })
         .collect();
+    sizing.finish();
 
     sizes
         .into_iter()
