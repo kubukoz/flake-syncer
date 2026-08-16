@@ -13,10 +13,33 @@ pub struct Config {
     /// How deep below each root to descend.
     #[serde(default = "default_depth")]
     pub max_depth: usize,
+    /// Paths to skip. An entry matches a project when it is equal to, or a
+    /// parent of, the project directory — so listing a directory ignores
+    /// everything beneath it.
+    ///
+    /// Relative entries are matched against the tail of the project path, which
+    /// makes `talks/nix-scala-folks` work without spelling out `$HOME`.
+    #[serde(default)]
+    pub ignore: Vec<PathBuf>,
 }
 
 fn default_depth() -> usize {
     4
+}
+
+/// Whether `project` is excluded by any `ignore` entry.
+pub fn is_ignored(project: &std::path::Path, ignore: &[PathBuf]) -> bool {
+    ignore.iter().any(|pat| {
+        if pat.is_absolute() {
+            project.starts_with(pat)
+        } else {
+            // Match on a path-component boundary, so `talks` does not ignore
+            // `talks-archive`, and the pattern may name any ancestor.
+            project
+                .ancestors()
+                .any(|a| a.ends_with(pat))
+        }
+    })
 }
 
 impl Default for Config {
@@ -25,7 +48,7 @@ impl Default for Config {
         let roots = home
             .map(|h| vec![h.join("dev"), h.join("projects"), h.join(".nixpkgs")])
             .unwrap_or_default();
-        Config { roots, max_depth: default_depth() }
+        Config { roots, max_depth: default_depth(), ignore: Vec::new() }
     }
 }
 
@@ -55,6 +78,58 @@ pub fn load_config() -> Result<Config> {
     Ok(cfg)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pats(v: &[&str]) -> Vec<PathBuf> {
+        v.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn absolute_ignore_covers_descendants() {
+        let ig = pats(&["/home/k/projects/talks"]);
+        assert!(is_ignored(std::path::Path::new("/home/k/projects/talks"), &ig));
+        assert!(is_ignored(
+            std::path::Path::new("/home/k/projects/talks/nix-scala-folks"),
+            &ig
+        ));
+        assert!(!is_ignored(std::path::Path::new("/home/k/projects/other"), &ig));
+    }
+
+    #[test]
+    fn relative_ignore_matches_the_path_tail() {
+        let ig = pats(&["talks/nix-scala-folks"]);
+        assert!(is_ignored(
+            std::path::Path::new("/home/k/projects/talks/nix-scala-folks"),
+            &ig
+        ));
+        assert!(!is_ignored(
+            std::path::Path::new("/home/k/projects/talks/other"),
+            &ig
+        ));
+    }
+
+    #[test]
+    fn ignore_respects_component_boundaries() {
+        // A prefix match would wrongly ignore `talks-archive`.
+        let ig = pats(&["talks"]);
+        assert!(!is_ignored(
+            std::path::Path::new("/home/k/projects/talks-archive"),
+            &ig
+        ));
+        assert!(is_ignored(
+            std::path::Path::new("/home/k/projects/talks/deep/nested"),
+            &ig
+        ));
+    }
+
+    #[test]
+    fn empty_ignore_matches_nothing() {
+        assert!(!is_ignored(std::path::Path::new("/anything"), &[]));
+    }
+}
+
 /// Find `flake.lock` files under the configured roots.
 ///
 /// `.git` and `.direnv` are skipped: the latter contains materialized copies of
@@ -82,7 +157,12 @@ pub fn find_lockfiles(cfg: &Config) -> Vec<PathBuf> {
 
         for entry in walker.filter_map(|e| e.ok()) {
             if entry.file_type().is_file() && entry.file_name() == "flake.lock" {
-                out.push(entry.into_path());
+                let path = entry.into_path();
+                let project = path.parent().unwrap_or(&path);
+                if is_ignored(project, &cfg.ignore) {
+                    continue;
+                }
+                out.push(path);
                 progress.advance(1);
             }
         }

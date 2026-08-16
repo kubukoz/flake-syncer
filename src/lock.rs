@@ -9,7 +9,7 @@
 use crate::progress::Progress;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -25,6 +25,28 @@ pub struct LockFile {
 pub struct Node {
     pub original: Option<Ref>,
     pub locked: Option<Locked>,
+    /// Edges to other nodes. On the root node this names the flake's own
+    /// direct inputs; values are either a node name or a follows-path.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, InputEdge>,
+}
+
+/// An entry in a node's `inputs` map: either `"node"` or `["parent", "child"]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum InputEdge {
+    Node(String),
+    Follows(Vec<String>),
+}
+
+impl InputEdge {
+    /// The node this edge resolves to, for the direct-input check.
+    fn node_name(&self) -> Option<&str> {
+        match self {
+            InputEdge::Node(n) => Some(n.as_str()),
+            InputEdge::Follows(path) => path.first().map(|s| s.as_str()),
+        }
+    }
 }
 
 /// The flakeref as written by the user, before resolution.
@@ -128,6 +150,12 @@ pub struct Pin {
     pub input_name: String,
     pub version: String,
     pub last_modified: Option<i64>,
+    /// Whether the project's own `flake.nix` declares this input.
+    ///
+    /// Only direct inputs can be retargeted with `--override-input`; transitive
+    /// ones belong to a dependency's lockfile, so an action against them would
+    /// fail. They are recorded but excluded from the default view and the plan.
+    pub direct: bool,
 }
 
 /// All pins of a single identity, across every scanned project.
@@ -138,25 +166,10 @@ pub struct Group {
 }
 
 impl Group {
-    /// Distinct versions in use. One means everyone agrees.
-    pub fn distinct_versions(&self) -> Vec<&str> {
-        let mut v: Vec<&str> = self.pins.iter().map(|p| p.version.as_str()).collect();
-        v.sort_unstable();
-        v.dedup();
-        v
-    }
-
-    pub fn is_divergent(&self) -> bool {
-        self.distinct_versions().len() > 1
-    }
-
-    /// The newest version already pinned by some project, by `lastModified`.
-    ///
-    /// This is the default sync target: it needs no network, and the store path
-    /// is likely already present, so converging on it can free space immediately
-    /// rather than downloading something new.
-    pub fn newest_in_use(&self) -> Option<&Pin> {
-        self.pins.iter().max_by_key(|p| p.last_modified.unwrap_or(i64::MIN))
+    /// Transitive pins, shown for context but never planned against: they live
+    /// in a dependency's lockfile, where `--override-input` cannot reach them.
+    pub fn transitive_count(&self) -> usize {
+        self.pins.iter().filter(|p| !p.direct).count()
     }
 }
 
@@ -188,6 +201,14 @@ pub fn group(lock_paths: &[PathBuf]) -> (Vec<Group>, Vec<(PathBuf, anyhow::Error
         };
         let project = lock_path.parent().unwrap_or(lock_path).to_path_buf();
 
+        // The root node's inputs are exactly the flake's own declared inputs;
+        // every other node reached the lockfile through a dependency.
+        let direct_nodes: BTreeSet<&str> = lock
+            .nodes
+            .get(&lock.root)
+            .map(|r| r.inputs.values().filter_map(|e| e.node_name()).collect())
+            .unwrap_or_default();
+
         for (name, node) in &lock.nodes {
             if *name == lock.root {
                 continue;
@@ -205,6 +226,7 @@ pub fn group(lock_paths: &[PathBuf]) -> (Vec<Group>, Vec<(PathBuf, anyhow::Error
                 input_name: name.clone(),
                 version: version.to_string(),
                 last_modified: locked.last_modified,
+                direct: direct_nodes.contains(name.as_str()),
             });
         }
     }
@@ -274,27 +296,49 @@ mod tests {
     }
 
     #[test]
-    fn newest_in_use_picks_highest_last_modified() {
+    fn transitive_pins_are_counted_separately() {
         let g = Group {
             identity: Identity::from_ref(&gh("nixos", "nixpkgs", None)).unwrap(),
             pins: vec![
-                Pin { project: "/a".into(), input_name: "nixpkgs".into(), version: "old".into(), last_modified: Some(100) },
-                Pin { project: "/b".into(), input_name: "nixpkgs".into(), version: "new".into(), last_modified: Some(900) },
+                Pin { project: "/a".into(), input_name: "nixpkgs".into(), version: "same".into(), last_modified: Some(1), direct: true },
+                Pin { project: "/b".into(), input_name: "nixpkgs_2".into(), version: "other".into(), last_modified: Some(2), direct: false },
             ],
         };
-        assert!(g.is_divergent());
-        assert_eq!(g.newest_in_use().unwrap().version, "new");
+        assert_eq!(g.transitive_count(), 1);
     }
 
     #[test]
-    fn single_version_is_not_divergent() {
-        let g = Group {
-            identity: Identity::from_ref(&gh("nixos", "nixpkgs", None)).unwrap(),
-            pins: vec![
-                Pin { project: "/a".into(), input_name: "nixpkgs".into(), version: "same".into(), last_modified: Some(1) },
-                Pin { project: "/b".into(), input_name: "nixpkgs".into(), version: "same".into(), last_modified: Some(2) },
-            ],
-        };
-        assert!(!g.is_divergent());
+    fn direct_inputs_are_read_from_the_root_node() {
+        // `follows` entries are arrays; plain deps are strings. Both are direct.
+        let json = r#"{
+          "root": "root",
+          "nodes": {
+            "root": { "inputs": { "nixpkgs": "nixpkgs", "utils": ["flake-utils"] } },
+            "nixpkgs": {
+              "original": { "type": "github", "owner": "nixos", "repo": "nixpkgs" },
+              "locked": { "rev": "aaa", "lastModified": 1 }
+            },
+            "flake-utils": {
+              "original": { "type": "github", "owner": "numtide", "repo": "flake-utils" },
+              "locked": { "rev": "bbb", "lastModified": 2 }
+            },
+            "systems": {
+              "original": { "type": "github", "owner": "nix-systems", "repo": "default" },
+              "locked": { "rev": "ccc", "lastModified": 3 }
+            }
+          }
+        }"#;
+        let lock: LockFile = serde_json::from_str(json).unwrap();
+        let root = lock.nodes.get(&lock.root).unwrap();
+        let direct: BTreeSet<&str> = root
+            .inputs
+            .values()
+            .filter_map(|e| e.node_name())
+            .collect();
+        assert!(direct.contains("nixpkgs"));
+        assert!(direct.contains("flake-utils"));
+        // Pulled in by flake-utils, not declared by this flake.
+        assert!(!direct.contains("systems"));
     }
+
 }

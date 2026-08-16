@@ -16,54 +16,86 @@ use crate::progress::Progress;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-const AUTO_ROOTS: &str = "/nix/var/nix/gcroots/auto";
-
-/// A store path retained by direnv, and the projects whose roots retain it.
+/// A store path retained by at least one GC root.
 #[derive(Debug, Clone)]
 pub struct RootedPath {
     /// Retained for diagnostics; the map key carries the same value.
     #[allow(dead_code)]
     pub store_path: PathBuf,
+    /// Projects whose `.direnv/flake-inputs` roots retain this path. Dropping
+    /// all of these is within the tool's power.
     pub retained_by: BTreeSet<PathBuf>,
+    /// True when something outside direnv also holds this path: a profile, a
+    /// `result` symlink, a running process. Such a path cannot be reclaimed by
+    /// editing lockfiles, whatever we do to the direnv roots.
+    pub pinned_elsewhere: bool,
     pub size_bytes: u64,
 }
 
-/// Scan `/nix/var/nix/gcroots/auto` for direnv-managed flake input roots.
+/// Parse one `nix-store --gc --print-roots` line: `"<root>" -> <store path>`.
 ///
-/// Dangling links are skipped: Nix reports those as stale and they hold nothing.
+/// Roots the daemon censors (`{lsof}`, `{censored}`) name no filesystem path
+/// but still keep the target alive, so they count as external pins.
+fn parse_root_line(line: &str) -> Option<(String, PathBuf)> {
+    let (root, target) = line.rsplit_once(" -> ")?;
+    let root = root.trim().trim_matches('"').to_string();
+    let target = target.trim();
+    if !target.starts_with("/nix/store/") {
+        return None;
+    }
+    Some((root, PathBuf::from(target)))
+}
+
+/// The project a direnv flake-input root belongs to, if it is one.
+fn direnv_project(root: &str) -> Option<PathBuf> {
+    let (project, rest) = root.split_once("/.direnv/")?;
+    rest.contains("flake-inputs/")
+        .then(|| PathBuf::from(project))
+}
+
+/// Ask the Nix daemon for the authoritative GC root set.
+///
+/// This must come from `nix-store --gc --print-roots` rather than a walk of
+/// `/nix/var/nix/gcroots/auto`: profiles, `result` symlinks and running
+/// processes also root store paths, and a scan blind to them reports paths as
+/// reclaimable when something else is still holding them.
+///
+/// Returns an empty map if Nix is unavailable, which degrades to "no savings
+/// claimed" rather than to an overstatement.
 pub fn scan_roots() -> BTreeMap<PathBuf, RootedPath> {
     use rayon::prelude::*;
 
-    let mut retainers: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+    let links = Progress::new("gc roots", None);
 
-    let Ok(entries) = std::fs::read_dir(AUTO_ROOTS) else {
+    let output = std::process::Command::new("nix-store")
+        .args(["--gc", "--print-roots"])
+        .output();
+    let Ok(output) = output else {
+        links.finish();
         return BTreeMap::new();
     };
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-    let links = Progress::new("gc roots", None);
-    for entry in entries.filter_map(|e| e.ok()) {
-        let Ok(target) = std::fs::read_link(entry.path()) else {
+    let mut retainers: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+    let mut external: BTreeSet<PathBuf> = BTreeSet::new();
+
+    for line in stdout.lines() {
+        let Some((root, target)) = parse_root_line(line) else {
             continue;
         };
-        let target_str = target.to_string_lossy().to_string();
-
-        // Only direnv's per-project flake input roots are attributable to a
-        // project. Profile links and manual roots are left alone.
-        let Some((project, _)) = target_str.split_once("/.direnv/") else {
-            continue;
-        };
-        if !target_str.contains("/flake-inputs/") {
-            continue;
-        }
-        // A stale link points at a path that no longer exists.
+        // A stale root points at a path that no longer exists.
         let Ok(real) = std::fs::canonicalize(&target) else {
             continue;
         };
 
-        retainers
-            .entry(real)
-            .or_default()
-            .insert(PathBuf::from(project));
+        match direnv_project(&root) {
+            Some(project) => {
+                retainers.entry(real).or_default().insert(project);
+            }
+            None => {
+                external.insert(real);
+            }
+        }
         links.advance(1);
     }
     links.set(retainers.len());
@@ -91,9 +123,10 @@ pub fn scan_roots() -> BTreeMap<PathBuf, RootedPath> {
         .into_iter()
         .map(|(path, size_bytes)| {
             let retained_by = retainers.get(&path).cloned().unwrap_or_default();
+            let pinned_elsewhere = external.contains(&path);
             (
                 path.clone(),
-                RootedPath { store_path: path, retained_by, size_bytes },
+                RootedPath { store_path: path, retained_by, pinned_elsewhere, size_bytes },
             )
         })
         .collect()
@@ -121,11 +154,23 @@ fn dir_size(path: &Path) -> u64 {
     total
 }
 
+/// Projects that retain at least one store path via a GC root.
+///
+/// A project absent from this set holds nothing: converging its lockfile frees
+/// no disk space, which is the only reason this tool edits lockfiles at all.
+pub fn rooted_projects(roots: &BTreeMap<PathBuf, RootedPath>) -> BTreeSet<PathBuf> {
+    roots
+        .values()
+        .flat_map(|r| r.retained_by.iter().cloned())
+        .collect()
+}
+
 /// How many bytes would actually be freed by migrating `projects` off the
 /// versions they currently pin.
 ///
-/// A rooted path counts only when every project retaining it is in `projects`;
-/// otherwise some other project keeps it alive and nothing is freed.
+/// A rooted path counts only when every project retaining it is in `projects`
+/// and nothing outside direnv pins it; otherwise something keeps it alive and
+/// nothing is freed.
 pub fn reclaimable(
     roots: &BTreeMap<PathBuf, RootedPath>,
     projects: &BTreeSet<PathBuf>,
@@ -133,6 +178,9 @@ pub fn reclaimable(
     let mut bytes = 0;
     let mut count = 0;
     for rooted in roots.values() {
+        if rooted.pinned_elsewhere {
+            continue;
+        }
         if !rooted.retained_by.is_empty() && rooted.retained_by.is_subset(projects) {
             bytes += rooted.size_bytes;
             count += 1;
@@ -167,6 +215,7 @@ mod tests {
             RootedPath {
                 store_path: p,
                 retained_by: projects.iter().map(PathBuf::from).collect(),
+                pinned_elsewhere: false,
                 size_bytes: size,
             },
         )
@@ -201,6 +250,59 @@ mod tests {
         let migrating: BTreeSet<PathBuf> = ["/proj/b"].iter().map(PathBuf::from).collect();
 
         assert_eq!(reclaimable(&roots, &migrating), (0, 0));
+    }
+
+    #[test]
+    fn externally_pinned_paths_are_not_reclaimable() {
+        // A `result` symlink or running process holds this path too, so
+        // dropping the direnv root frees nothing.
+        let (p, mut r) = rooted("/store/a", 500, &["/proj/b"]);
+        r.pinned_elsewhere = true;
+        let roots: BTreeMap<_, _> = [(p, r)].into_iter().collect();
+        let migrating: BTreeSet<PathBuf> = ["/proj/b"].iter().map(PathBuf::from).collect();
+
+        assert_eq!(reclaimable(&roots, &migrating), (0, 0));
+    }
+
+    #[test]
+    fn root_lines_are_parsed() {
+        let (root, target) = parse_root_line(
+            r#""/Users/k/dev/x/.direnv/flake-inputs/abc-source" -> /nix/store/abc-source"#,
+        )
+        .unwrap();
+        assert_eq!(target, PathBuf::from("/nix/store/abc-source"));
+        assert_eq!(direnv_project(&root), Some(PathBuf::from("/Users/k/dev/x")));
+    }
+
+    #[test]
+    fn censored_process_roots_are_external_not_direnv() {
+        // `{lsof}` names no path, but the target is still alive.
+        let (root, target) =
+            parse_root_line(r#""{lsof}" -> /nix/store/xyz-nodejs"#).unwrap();
+        assert_eq!(target, PathBuf::from("/nix/store/xyz-nodejs"));
+        assert_eq!(direnv_project(&root), None);
+    }
+
+    #[test]
+    fn result_symlinks_are_not_attributed_to_a_project() {
+        // Sits inside a project dir, but is not a direnv flake input.
+        let (root, _) =
+            parse_root_line(r#""/Users/k/projects/wedding/result" -> /nix/store/w-web"#).unwrap();
+        assert_eq!(direnv_project(&root), None);
+    }
+
+    #[test]
+    fn rooted_projects_lists_direnv_retainers() {
+        let roots: BTreeMap<_, _> = [
+            rooted("/store/a", 1, &["/proj/b"]),
+            rooted("/store/c", 1, &["/proj/d", "/proj/b"]),
+        ]
+        .into_iter()
+        .collect();
+        let got = rooted_projects(&roots);
+        assert!(got.contains(&PathBuf::from("/proj/b")));
+        assert!(got.contains(&PathBuf::from("/proj/d")));
+        assert_eq!(got.len(), 2);
     }
 
     #[test]

@@ -45,38 +45,49 @@ fn main() -> Result<()> {
 
     // `--report` prints the analysis and exits, for scripting and for sanity
     // checks without entering the alternate screen.
-    if std::env::args().any(|a| a == "--report") {
-        return print_report(&groups, locks.len());
-    }
+    let report_only = std::env::args().any(|a| a == "--report");
+    // `--all-projects` drops the GC-root requirement in both modes.
+    let rooted_only = !std::env::args().any(|a| a == "--all-projects");
 
     let roots = store::scan_roots();
-    let app = App::new(groups, roots, parse_errors);
+    let mut app = App::new(groups, roots, parse_errors);
+    app.rooted_only = rooted_only;
+
+    if report_only {
+        return print_report(&app, locks.len());
+    }
     run_tui(app)
 }
 
-fn print_report(groups: &[lock::Group], lock_count: usize) -> Result<()> {
-    let roots = store::scan_roots();
-    println!("{lock_count} lockfiles, {} input identities", groups.len());
+/// The analysis, printed and exited: for scripting, and for sanity checks
+/// without entering the alternate screen.
+fn print_report(app: &App, lock_count: usize) -> Result<()> {
+    println!("{lock_count} lockfiles, {} input identities", app.groups.len());
+    if app.rooted_only {
+        println!("(only projects holding a GC root; --all-projects to include the rest)");
+    }
 
-    let mut divergent: Vec<&lock::Group> = groups.iter().filter(|g| g.is_divergent()).collect();
-    divergent.sort_by_key(|g| std::cmp::Reverse(g.distinct_versions().len()));
+    let mut divergent: Vec<&lock::Group> =
+        app.groups.iter().filter(|g| app.is_divergent(g)).collect();
+    divergent.sort_by_key(|g| std::cmp::Reverse(app.distinct_versions(g)));
 
     println!("\n{} divergent:", divergent.len());
     for g in &divergent {
         println!(
             "  {:>2} revs across {:>2} pins  {}",
-            g.distinct_versions().len(),
-            g.pins.len(),
+            app.distinct_versions(g),
+            app.actionable_pins(g).count(),
             g.identity
         );
     }
 
-    let all: BTreeSet<_> = groups
+    let all: BTreeSet<_> = app
+        .groups
         .iter()
-        .filter(|g| g.is_divergent())
-        .flat_map(|g| g.pins.iter().map(|p| p.project.clone()))
+        .filter(|g| app.is_divergent(g))
+        .flat_map(|g| app.actionable_pins(g).map(|p| p.project.clone()))
         .collect();
-    let (bytes, paths) = store::reclaimable(&roots, &all);
+    let (bytes, paths) = store::reclaimable(&app.roots, &all);
     println!(
         "\nUpper bound if every divergent group is unified and its direnv roots dropped:\n  {} across {paths} store paths",
         human_bytes(bytes)
@@ -128,6 +139,11 @@ fn event_loop(term: &mut Term, app: &mut App) -> Result<()> {
                     app.version_idx = 0;
                 }
                 KeyCode::Char('s') => app.stage(),
+                KeyCode::Char('A') => app.select_all_suggested(),
+                KeyCode::Char('N') => app.select_none(),
+                KeyCode::Char('g') => app.toggle_rooted_only(),
+                KeyCode::PageDown => app.scroll_details(1),
+                KeyCode::PageUp => app.scroll_details(-1),
                 _ => {}
             },
             Mode::Confirm => match key.code {

@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::lock::{Group, Identity};
+use crate::lock::{Group, Identity, Pin};
 
 /// A single project-level edit: point `input_name` at `target_version`.
 #[derive(Debug, Clone)]
@@ -23,20 +23,18 @@ pub struct Action {
     pub target_version: String,
 }
 
-/// Build the actions needed to bring every pin in `group` to `target_version`.
-pub fn plan(group: &Group, target_version: &str) -> Vec<Action> {
-    group
-        .pins
-        .iter()
-        .filter(|p| p.version != target_version)
-        .map(|p| Action {
-            project: p.project.clone(),
-            input_name: p.input_name.clone(),
-            identity: group.identity.clone(),
-            from_version: p.version.clone(),
-            target_version: target_version.to_string(),
-        })
-        .collect()
+/// The action bringing one pin to `target_version`.
+///
+/// Callers decide which pins are eligible: only direct inputs can be reached by
+/// `--override-input`, and only rooted projects free anything by moving.
+pub fn action_for(group: &Group, pin: &Pin, target_version: &str) -> Action {
+    Action {
+        project: pin.project.clone(),
+        input_name: pin.input_name.clone(),
+        identity: group.identity.clone(),
+        from_version: pin.version.clone(),
+        target_version: target_version.to_string(),
+    }
 }
 
 /// The flakeref pinning `identity` at an exact revision.
@@ -61,9 +59,9 @@ pub fn command_line(action: &Action) -> String {
 
 /// Execute one action.
 ///
-/// Only inputs named directly in the lockfile's root set can be overridden this
-/// way; transitive inputs (`nixpkgs_2` and friends) belong to a dependency's own
-/// lockfile and are reported as skipped rather than silently ignored.
+/// Actions only ever name direct inputs — transitive ones are filtered out
+/// before planning, since `--override-input` cannot reach them. A failure here
+/// is a genuine Nix error and is surfaced verbatim.
 pub fn apply(action: &Action) -> Result<()> {
     let flake_nix = action.project.join("flake.nix");
     if !flake_nix.exists() {
