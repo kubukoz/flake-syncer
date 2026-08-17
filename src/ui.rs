@@ -47,6 +47,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             format!("~{} reclaimable ({} paths)", human_bytes(bytes), paths),
             Style::new().fg(Color::Green),
         ),
+        Span::raw("  "),
+        // The rooted-only filter hides whole projects. Saying so here is what
+        // makes `g` discoverable — otherwise the counts look unexplained.
+        scope_span(app),
     ]);
     // Unreadable lockfiles are surfaced rather than silently dropped: they make
     // the divergence counts an undercount.
@@ -65,6 +69,22 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(line).block(Block::default().borders(Borders::ALL)),
         area,
     );
+}
+
+/// The current project scope, and what it is excluding.
+fn scope_span(app: &App) -> Span<'static> {
+    let (shown, hidden) = app.project_scope();
+    if app.rooted_only {
+        Span::styled(
+            format!("{shown} rooted projects (g: +{hidden} unrooted)"),
+            Style::new().fg(Color::Blue),
+        )
+    } else {
+        Span::styled(
+            format!("all {shown} projects (g: rooted only)"),
+            Style::new().fg(Color::Blue).bold(),
+        )
+    }
 }
 
 fn draw_browse(f: &mut Frame, area: Rect, app: &App) {
@@ -355,12 +375,17 @@ fn draw_report(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    // `g` and `a` are toggles, so the legend names what the key would switch
+    // *to* rather than showing a state-independent label.
     let keys = match app.mode {
-        Mode::Browse => {
-            "↑↓ move  Tab pane  Enter pick  x exclude  A/N all/none  a divergent  g rooted-only  s stage  q quit"
-        }
-        Mode::Confirm => "Enter run  Esc cancel  q quit",
-        Mode::Report => "q quit",
+        Mode::Browse => format!(
+            "↑↓ move  Tab pane  Enter pick  x exclude  A/N all/none  \
+             a {}  g {}  s stage  q quit",
+            if app.show_all { "divergent only" } else { "show all" },
+            if app.rooted_only { "+unrooted" } else { "rooted only" },
+        ),
+        Mode::Confirm => "Enter run  Esc cancel  q quit".to_string(),
+        Mode::Report => "q quit".to_string(),
     };
     let mut spans = vec![Span::styled(keys, Style::new().fg(Color::DarkGray))];
     if !app.status.is_empty() {

@@ -215,6 +215,21 @@ impl App {
             .count()
     }
 
+    /// Projects currently in scope, and how many the rooted-only filter hides.
+    pub fn project_scope(&self) -> (usize, usize) {
+        let all: BTreeSet<&PathBuf> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.pins.iter().filter(|p| p.direct).map(|p| &p.project))
+            .collect();
+        let rooted = all.iter().filter(|p| self.rooted.contains(**p)).count();
+        if self.rooted_only {
+            (rooted, all.len() - rooted)
+        } else {
+            (all.len(), 0)
+        }
+    }
+
     pub fn toggle_rooted_only(&mut self) {
         self.rooted_only = !self.rooted_only;
         // Selections may now refer to groups that are no longer divergent.
@@ -525,6 +540,23 @@ mod tests {
         app.toggle_rooted_only();
         assert!(app.is_divergent(&app.groups[0]));
         assert_eq!(app.actionable_pins(&app.groups[0]).count(), 2);
+    }
+
+    #[test]
+    fn project_scope_reports_what_the_filter_hides() {
+        let mut app = app_with(
+            vec![
+                pin("/a", "nixpkgs", "one", true),
+                pin("/b", "nixpkgs", "two", true),
+                pin("/c", "nixpkgs", "three", true),
+            ],
+            &["/a"],
+        );
+        // Rooted-only: one in scope, two hidden.
+        assert_eq!(app.project_scope(), (1, 2));
+
+        app.toggle_rooted_only();
+        assert_eq!(app.project_scope(), (3, 0));
     }
 
     #[test]
