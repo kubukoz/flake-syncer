@@ -6,6 +6,7 @@ projects but pinned to different revisions — and converging them.
 ```
 cargo run --release                     # interactive TUI
 cargo run --release -- --report         # non-interactive summary
+cargo run --release -- --roots          # what holds each rooted store path
 cargo run --release -- --all-projects   # include projects with no GC root
 ```
 
@@ -24,6 +25,11 @@ it includes profiles, `result` symlinks and paths held open by running
 processes (reported as `{lsof}`), none of which live under
 `/nix/var/nix/gcroots/auto`. A path pinned by any non-direnv root is excluded
 from the savings figure entirely — dropping direnv's link cannot free it.
+
+Note that `--print-roots` is not a pure read: scanning roots makes Nix prune
+`gcroots/auto` symlinks that already point at deleted paths, and it logs each
+one. Only dangling pointers go, and no repository file is touched — but the
+scan every startup performs does write to GC state.
 
 Two consequences follow, and both are deliberate defaults:
 
@@ -45,6 +51,28 @@ Two caveats on the figure, both deliberate:
   bytes are shared and would not come back.
 - Nothing is freed until you run `nix store gc`. The tool only removes the GC
   root symlinks; it never touches `/nix/store` itself.
+
+## The roots view
+
+`nix-store --gc --print-roots` lists roots and leaves you to work out what each
+one holds. The roots view inverts that: press `r` in the TUI, or run
+`--roots`, and every rooted store path is listed largest first with the roots
+holding it — split into direnv projects (droppable by this tool), durable
+external roots (profiles, `result` symlinks, channels), and running processes.
+
+`·` marks a path droppable by dropping direnv roots alone; `×` marks one
+something else pins.
+
+**Process roots are hidden by default.** A path a process merely has open says
+nothing about whether it is durably pinned, and on a working machine `{lsof}`
+entries swamp the list — on the author's store they were most of 1048 rows.
+Press `p`, or pass `--with-process-roots`, to see them. Paths *only* a process
+holds disappear entirely with the filter on, since with their sole retainer
+hidden they would list with nothing explaining why.
+
+This is presentation only. `store::reclaimable` still treats a process root as
+blocking, so the savings figure never counts space a live process is holding —
+hiding a root must never turn into claiming its bytes.
 
 ## Identity grouping
 
@@ -160,10 +188,15 @@ inputs it has.
 | `e` | open a `flake.nix` in your editor |
 | `a` | toggle divergent-only / all |
 | `g` | toggle rooted-only / include projects with no GC root |
+| `r` | open the roots view (read-only) |
 | `s` | stage plan (shows every command and every diff) |
 | `Enter` (staged) | execute |
 | `Esc` | cancel |
 | `q` | quit |
+
+In the roots view: `↑`/`↓` move, `f` filters to droppable paths only, `p`
+toggles process-held paths, `Esc` returns. Nothing there stages or applies
+anything.
 
 **Nothing is selected on startup.** Each group's suggested version — the
 **newest revision already in use**, marked `·` — needs no network and is usually

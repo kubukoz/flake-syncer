@@ -50,17 +50,77 @@ fn main() -> Result<()> {
     // `--report` prints the analysis and exits, for scripting and for sanity
     // checks without entering the alternate screen.
     let report_only = std::env::args().any(|a| a == "--report");
+    // `--roots` prints the reverse root index and exits: the same data the TUI's
+    // roots view shows, for grepping and for checking the scan without a TTY.
+    let roots_only = std::env::args().any(|a| a == "--roots");
+    // Process roots are hidden in both modes by default; this opts back in.
+    let with_process = std::env::args().any(|a| a == "--with-process-roots");
     // `--all-projects` drops the GC-root requirement in both modes.
     let rooted_only = !std::env::args().any(|a| a == "--all-projects");
 
     let roots = store::scan_roots();
     let mut app = App::new(groups, roots, parse_errors, cfg);
     app.rooted_only = rooted_only;
+    app.roots_hide_process = !with_process;
 
+    if roots_only {
+        return print_roots(&app);
+    }
     if report_only {
         return print_report(&app, locks.len());
     }
     run_tui(app)
+}
+
+/// The reverse root index, printed and exited.
+///
+/// `nix-store --gc --print-roots` answers "what roots exist"; this answers the
+/// question that actually blocks a store from shrinking — for each rooted path,
+/// who is holding it, and whether this tool could let go.
+fn print_roots(app: &App) -> Result<()> {
+    let rows = app.root_rows();
+    if rows.is_empty() {
+        println!("No GC roots found (is nix-store on PATH?)");
+        return Ok(());
+    }
+
+    let freeable: Vec<_> = rows.iter().filter(|r| r.freeable()).collect();
+    let freeable_bytes: u64 = freeable.iter().map(|r| r.size_bytes).sum();
+
+    println!(
+        "{} rooted store path(s), {} held (upper bound)",
+        rows.len(),
+        human_bytes(app.roots_total_bytes())
+    );
+    println!(
+        "{} droppable by direnv roots alone, {}",
+        freeable.len(),
+        human_bytes(freeable_bytes)
+    );
+    if app.roots_hide_process {
+        println!("(process-held paths hidden; --with-process-roots to include them)");
+    }
+    println!();
+
+    for r in &rows {
+        println!(
+            "{} {:>10}  {}",
+            if r.freeable() { "·" } else { "×" },
+            human_bytes(r.size_bytes),
+            r.store_path.display()
+        );
+        for p in &r.projects {
+            println!("             direnv    {}", p.display());
+        }
+        for e in &r.external {
+            println!("             external  {e}");
+        }
+        for p in &r.process {
+            println!("             process   {p}");
+        }
+    }
+    println!("\n· droppable by this tool   × pinned outside direnv");
+    Ok(())
 }
 
 /// The analysis, printed and exited: for scripting, and for sanity checks
@@ -186,6 +246,7 @@ fn event_loop(term: &mut Term, app: &mut App) -> Result<()> {
                 KeyCode::Char('m') => app.toggle_merge_mark(),
                 KeyCode::Char('M') => app.commit_merge(),
                 KeyCode::Char('e') => open_in_editor(term, app)?,
+                KeyCode::Char('r') => app.open_roots(),
                 KeyCode::PageDown => app.scroll_details(1),
                 KeyCode::PageUp => app.scroll_details(-1),
                 _ => {}
@@ -206,11 +267,23 @@ fn event_loop(term: &mut Term, app: &mut App) -> Result<()> {
             // than acted on: a keystroke typed during a long update should not
             // be replayed against whatever screen follows it.
             Mode::Running => {}
-            Mode::Report => {
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Enter | KeyCode::Esc) {
-                    break;
-                }
-            }
+            Mode::Report => match key.code {
+                // Inspecting what is still rooted is the natural next question
+                // after a run, so the view opens from here too.
+                KeyCode::Char('r') => app.open_roots(),
+                KeyCode::Char('q') | KeyCode::Enter | KeyCode::Esc => break,
+                _ => {}
+            },
+            // Read-only: nothing here stages or applies anything.
+            Mode::Roots => match key.code {
+                KeyCode::Char('q') => break,
+                KeyCode::Esc => app.close_roots(),
+                KeyCode::Up | KeyCode::Char('k') => app.roots_up(),
+                KeyCode::Down | KeyCode::Char('j') => app.roots_down(),
+                KeyCode::Char('f') => app.toggle_roots_filter(),
+                KeyCode::Char('p') => app.toggle_roots_process(),
+                _ => {}
+            },
         }
     }
     Ok(())

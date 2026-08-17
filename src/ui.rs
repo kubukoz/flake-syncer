@@ -26,6 +26,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Confirm => draw_confirm(f, chunks[1], app),
         Mode::Running => draw_running(f, chunks[1], app),
         Mode::Report => draw_report(f, chunks[1], app),
+        Mode::Roots => draw_roots(f, chunks[1], app),
     }
 
     draw_footer(f, chunks[2], app);
@@ -46,6 +47,35 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 human_duration(r.started.elapsed()),
                 Style::new().fg(Color::DarkGray),
+            ),
+        ]);
+        f.render_widget(
+            Paragraph::new(line).block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+        return;
+    }
+
+    // The roots view is about store paths, not input groups, so the divergent
+    // and selected counts would describe a screen the user is not looking at.
+    if app.mode == Mode::Roots {
+        let rows = app.root_rows();
+        let freeable = rows.iter().filter(|r| r.freeable()).count();
+        let line = Line::from(vec![
+            Span::styled("flake-syncer", Style::new().bold().fg(Color::Cyan)),
+            Span::raw("  "),
+            Span::styled("gc roots", Style::new().fg(Color::Yellow).bold()),
+            Span::raw("  "),
+            Span::raw(format!("{} path(s)", rows.len())),
+            Span::raw("  "),
+            Span::styled(
+                format!("{} held", human_bytes(app.roots_total_bytes())),
+                Style::new().fg(Color::DarkGray),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{freeable} droppable"),
+                Style::new().fg(Color::Green),
             ),
         ]);
         f.render_widget(
@@ -732,13 +762,182 @@ fn draw_report(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// The reverse of `nix-store --gc --print-roots`: rooted store paths on the
+/// left, and for the highlighted one, every root holding it on the right.
+///
+/// Split rather than a flat list because a path can be held by a dozen roots;
+/// inlining them would push the size column off screen, and the sizes are how
+/// the list is ranked.
+fn draw_roots(f: &mut Frame, area: Rect, app: &App) {
+    let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(area);
+
+    let rows = app.root_rows();
+    let title = format!(
+        " rooted store paths — {} total{}{} ",
+        human_bytes(app.roots_total_bytes()),
+        if app.roots_freeable_only { ", droppable only" } else { "" },
+        if app.roots_hide_process { "" } else { ", +process" },
+    );
+
+    if rows.is_empty() {
+        f.render_widget(
+            // Distinguish "nix told us nothing" from "the filters hid it all",
+            // which need opposite actions from the user.
+            Paragraph::new(if app.roots.is_empty() {
+                "No GC roots found.\n\nThis needs `nix-store` on PATH."
+            } else if app.roots_freeable_only {
+                "Nothing here is droppable by direnv roots alone.\n\nPress f to show every rooted path."
+            } else {
+                "Nothing rooted outside running processes.\n\nPress p to include process-held paths."
+            })
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(title)),
+            cols[0],
+        );
+        f.render_widget(
+            Block::default().borders(Borders::ALL).title(" retained by "),
+            cols[1],
+        );
+        return;
+    }
+
+    // Keep the cursor on screen for stores with thousands of rooted paths.
+    let height = cols[0].height.saturating_sub(2) as usize;
+    let offset = app.roots_idx.saturating_sub(height.saturating_sub(1));
+
+    let items: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(height)
+        .map(|(i, r)| {
+            let selected = i == app.roots_idx;
+            // A path nothing outside direnv holds is one this tool could
+            // actually free, which is the distinction the view is for.
+            let marker = if r.freeable() { "·" } else { "×" };
+            let name = r
+                .store_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| r.store_path.display().to_string());
+            let style = if selected {
+                Style::new().fg(Color::Black).bg(Color::Cyan)
+            } else if r.freeable() {
+                Style::new()
+            } else {
+                Style::new().fg(Color::DarkGray)
+            };
+            Line::from(Span::styled(
+                format!(
+                    "{marker} {:>9}  {:>2}  {name}",
+                    human_bytes(r.size_bytes),
+                    r.retainer_count(),
+                ),
+                style,
+            ))
+        })
+        .collect();
+
+    f.render_widget(
+        Paragraph::new(items).block(Block::default().borders(Borders::ALL).title(title)),
+        cols[0],
+    );
+
+    draw_root_detail(f, cols[1], app);
+}
+
+/// Everything holding the highlighted store path.
+fn draw_root_detail(f: &mut Frame, area: Rect, app: &App) {
+    let Some(row) = app.selected_root() else {
+        f.render_widget(
+            Block::default().borders(Borders::ALL).title(" retained by "),
+            area,
+        );
+        return;
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            row.store_path.display().to_string(),
+            Style::new().fg(Color::Cyan),
+        )),
+        Line::from(format!("{} across {} root(s)", human_bytes(row.size_bytes), row.retainer_count())),
+        Line::from(""),
+    ];
+
+    if !row.projects.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "direnv (droppable by this tool)",
+            Style::new().fg(Color::Green),
+        )));
+        for p in &row.projects {
+            lines.push(Line::from(format!("  {}", p.display())));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if !row.external.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "external (must be released elsewhere)",
+            Style::new().fg(Color::Yellow),
+        )));
+        for e in &row.external {
+            lines.push(Line::from(format!("  {e}")));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if !row.process.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "running processes (transient)",
+            Style::new().fg(Color::DarkGray),
+        )));
+        for p in &row.process {
+            lines.push(Line::from(format!("  {p}")));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Say plainly whether the space is actually recoverable — the whole point
+    // of separating the two lists above.
+    lines.push(Line::from(if row.freeable() {
+        Span::styled(
+            "Converging these projects and dropping their roots would free this.",
+            Style::new().fg(Color::Green),
+        )
+    } else if row.blocked_only_by_process() {
+        Span::styled(
+            "Only a running process holds this — it frees once that exits.",
+            Style::new().fg(Color::DarkGray),
+        )
+    } else if row.projects.is_empty() {
+        Span::styled(
+            "No direnv root holds this; this tool cannot free it.",
+            Style::new().fg(Color::DarkGray),
+        )
+    } else {
+        Span::styled(
+            "Held outside direnv too — dropping direnv roots frees nothing here.",
+            Style::new().fg(Color::Yellow),
+        )
+    }));
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" retained by ")),
+        area,
+    );
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     // `g` and `a` are toggles, so the legend names what the key would switch
     // *to* rather than showing a state-independent label.
     let keys = match app.mode {
         Mode::Browse => format!(
             "↑↓ move  Tab pane  Enter pick  x exclude  A/N all/none  m mark  M merge  \
-             e edit  a {}  g {}  s stage  q quit",
+             e edit  r roots  a {}  g {}  s stage  q quit",
             if app.show_all { "divergent only" } else { "show all" },
             if app.rooted_only { "+unrooted" } else { "rooted only" },
         ),
@@ -746,7 +945,12 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         // No keys: the run blocks until it finishes, and offering an abort we
         // cannot honour mid-`nix`-invocation would be a lie.
         Mode::Running => "running — please wait".to_string(),
-        Mode::Report => "q quit".to_string(),
+        Mode::Report => "r roots  q quit".to_string(),
+        Mode::Roots => format!(
+            "↑↓ move  f {}  p {}  Esc back  q quit",
+            if app.roots_freeable_only { "show all" } else { "droppable only" },
+            if app.roots_hide_process { "+process" } else { "hide process" },
+        ),
     };
     let mut spans = vec![Span::styled(keys, Style::new().fg(Color::DarkGray))];
     // The status line carries browse-mode feedback ("target set to…"), which is
@@ -862,6 +1066,149 @@ mod render_tests {
         // Must not panic on a small area; the log simply gets less room.
         let out = render(&running_app(), 40, 10);
         assert!(out.contains("running"), "{out}");
+    }
+
+    fn roots_app() -> App {
+        let mut app = crate::app::test_support::app_with_roots();
+        app.open_roots();
+        app
+    }
+
+    #[test]
+    fn the_roots_screen_ranks_paths_by_size() {
+        let out = render(&roots_app(), 110, 24);
+        let big = out
+            .find("aaa-nixpkgs-source")
+            .unwrap_or_else(|| panic!("largest path missing:\n{out}"));
+        let small = out
+            .find("ccc-jdk")
+            .unwrap_or_else(|| panic!("smallest path missing:\n{out}"));
+        assert!(big < small, "largest path should sort first:\n{out}");
+    }
+
+    #[test]
+    fn the_roots_screen_names_what_holds_the_selected_path() {
+        // Cursor starts on the largest path, held only by one project.
+        let out = render(&roots_app(), 110, 24);
+        assert!(out.contains("/Users/k/projects/myapp"), "{out}");
+        assert!(out.contains("direnv"), "{out}");
+    }
+
+    #[test]
+    fn an_externally_pinned_path_says_it_cannot_be_freed() {
+        let mut app = roots_app();
+        // Move to the jdk, which a profile and a process both hold.
+        app.roots_down();
+        app.roots_down();
+        let out = render(&app, 110, 24);
+        assert!(out.contains("/run/current-system"), "{out}");
+        assert!(out.contains("frees nothing"), "{out}");
+        // Process roots are hidden by default, even on a row that stays listed
+        // because something durable also holds it.
+        assert!(!out.contains("{lsof}"), "{out}");
+    }
+
+    #[test]
+    fn process_roots_appear_once_asked_for() {
+        let mut app = roots_app();
+        app.toggle_roots_process();
+        app.roots_down();
+        app.roots_down();
+        let out = render(&app, 110, 24);
+        assert!(out.contains("{lsof}"), "{out}");
+        assert!(out.contains("running processes"), "{out}");
+    }
+
+    #[test]
+    fn a_path_only_a_process_holds_is_hidden_by_default() {
+        let mut app = crate::app::test_support::app_with_roots();
+        // Pin the second path with a process and nothing else.
+        let key = std::path::PathBuf::from("/nix/store/bbb-utils-source");
+        app.roots
+            .get_mut(&key)
+            .unwrap()
+            .external_roots
+            .insert("{temp:4242}".into());
+        app.open_roots();
+
+        let hidden = render(&app, 110, 24);
+        assert!(!hidden.contains("bbb-utils-source"), "{hidden}");
+
+        app.toggle_roots_process();
+        let shown = render(&app, 110, 24);
+        assert!(shown.contains("bbb-utils-source"), "{shown}");
+    }
+
+    #[test]
+    fn a_path_no_direnv_root_holds_is_hidden_with_process_roots() {
+        // Real case: a JDK held only by {lsof}. With process roots hidden it
+        // would otherwise list with no retainers at all.
+        let mut app = crate::app::test_support::app_with_roots();
+        let p = std::path::PathBuf::from("/nix/store/ddd-jdk-only-lsof");
+        app.roots.insert(
+            p.clone(),
+            crate::store::RootedPath {
+                store_path: p,
+                retained_by: Default::default(),
+                external_roots: ["{lsof}".to_string()].into_iter().collect(),
+                size_bytes: 400_000_000,
+            },
+        );
+        app.open_roots();
+
+        let out = render(&app, 110, 24);
+        assert!(!out.contains("ddd-jdk-only-lsof"), "{out}");
+
+        app.toggle_roots_process();
+        let shown = render(&app, 110, 24);
+        assert!(shown.contains("ddd-jdk-only-lsof"), "{shown}");
+    }
+
+    #[test]
+    fn hiding_process_roots_never_marks_a_pinned_path_droppable() {
+        // The filter must not make `freeable` true for a path a process pins;
+        // that would advertise space the user cannot actually get back.
+        let mut app = crate::app::test_support::app_with_roots();
+        let key = std::path::PathBuf::from("/nix/store/bbb-utils-source");
+        app.roots
+            .get_mut(&key)
+            .unwrap()
+            .external_roots
+            .insert("{lsof}".into());
+        app.open_roots();
+        app.roots_freeable_only = true;
+
+        assert!(
+            !app.root_rows()
+                .iter()
+                .any(|r| r.store_path.ends_with("bbb-utils-source")),
+            "process-pinned path leaked into the droppable list"
+        );
+    }
+
+    #[test]
+    fn the_freeable_filter_hides_externally_pinned_paths() {
+        let mut app = roots_app();
+        app.toggle_roots_filter();
+        let out = render(&app, 110, 24);
+        assert!(out.contains("aaa-nixpkgs-source"), "{out}");
+        // Held by {lsof} and a profile, so dropping direnv roots frees nothing.
+        assert!(!out.contains("ccc-jdk"), "{out}");
+    }
+
+    #[test]
+    fn the_roots_screen_survives_an_empty_root_set() {
+        // No nix, or a store with nothing rooted.
+        let mut app = crate::app::test_support::app_for_render();
+        app.open_roots();
+        let out = render(&app, 110, 24);
+        assert!(out.contains("No GC roots found"), "{out}");
+    }
+
+    #[test]
+    fn a_narrow_terminal_still_renders_the_roots_screen() {
+        let out = render(&roots_app(), 40, 10);
+        assert!(out.contains("gc roots"), "{out}");
     }
 }
 

@@ -102,6 +102,11 @@ pub enum Mode {
     Running,
     /// Actions have run; showing the outcome.
     Report,
+    /// Browsing GC roots in reverse: each rooted store path and what holds it.
+    ///
+    /// The inverse of `nix-store --gc --print-roots`, which lists roots and
+    /// leaves the "so what is keeping this alive" question unanswered.
+    Roots,
 }
 
 /// What an action is doing right now, for the running display.
@@ -258,6 +263,25 @@ pub struct App {
     pub config: Config,
     /// Scroll offset of the details pane, for groups with many projects.
     pub details_scroll: u16,
+
+    /// Cursor into the roots view's rows.
+    pub roots_idx: usize,
+    /// Restrict the roots view to paths that dropping direnv roots could free.
+    ///
+    /// Off by default: the durably-pinned paths are exactly what explains a
+    /// store that will not shrink, so hiding them by default would suppress the
+    /// answer the view exists to give.
+    pub roots_freeable_only: bool,
+    /// Hide paths whose only non-direnv retainer is a running process.
+    ///
+    /// On by default: `{lsof}` roots are transient and numerous — on a working
+    /// machine they bury the durable pins that actually explain a large store.
+    pub roots_hide_process: bool,
+    /// The mode to return to when leaving the roots view.
+    ///
+    /// Stored rather than hardcoded to `Browse` so the view can be opened from
+    /// the report screen without stranding the user somewhere they weren't.
+    roots_return_to: Mode,
 }
 
 impl App {
@@ -289,9 +313,111 @@ impl App {
             status: String::new(),
             config,
             details_scroll: 0,
+            roots_idx: 0,
+            roots_freeable_only: false,
+            roots_hide_process: true,
+            roots_return_to: Mode::Browse,
         };
         app.status = "nothing selected — Enter picks a version, A selects all".into();
         app
+    }
+
+    /// Rows for the roots view, honouring the freeable-only filter.
+    ///
+    /// Recomputed per call rather than cached: `roots` is fixed for the life of
+    /// the process (a rescan means a restart), so there is no staleness to
+    /// manage, and the row count is bounded by the store paths actually rooted.
+    pub fn root_rows(&self) -> Vec<store::RootRow> {
+        let mut rows = store::root_rows(&self.roots);
+
+        // Applied before any process roots are cleared: clearing them first
+        // would make `freeable()` true for a path a process really does pin,
+        // and this filter must never promise space that is not actually free.
+        if self.roots_freeable_only {
+            rows.retain(|r| r.freeable());
+        }
+
+        if self.roots_hide_process {
+            // A row held by a profile *and* a process still belongs in the list;
+            // only its process noise is dropped. Rows whose sole non-direnv
+            // retainer is a process go entirely — including ones nothing else
+            // holds at all, which would otherwise render with no retainers
+            // shown and no explanation for being listed.
+            rows.retain(|r| !r.blocked_only_by_process() && !r.process_only());
+            for r in &mut rows {
+                r.process.clear();
+            }
+        }
+        rows
+    }
+
+    /// Enter the roots view, remembering where to go back to.
+    pub fn open_roots(&mut self) {
+        self.roots_return_to = self.mode;
+        self.mode = Mode::Roots;
+        self.roots_idx = 0;
+        let rows = self.root_rows();
+        self.status = if rows.is_empty() {
+            "no GC roots found — is nix available?".into()
+        } else {
+            format!("{} rooted store path(s)", rows.len())
+        };
+    }
+
+    /// Leave the roots view for wherever it was opened from.
+    pub fn close_roots(&mut self) {
+        self.mode = self.roots_return_to;
+        self.status.clear();
+    }
+
+    pub fn roots_up(&mut self) {
+        self.roots_idx = self.roots_idx.saturating_sub(1);
+    }
+
+    pub fn roots_down(&mut self) {
+        let len = self.root_rows().len();
+        // An empty list must not move the cursor off zero, and the last row is
+        // len - 1; saturating_sub keeps both cases honest.
+        self.roots_idx = (self.roots_idx + 1).min(len.saturating_sub(1));
+    }
+
+    /// Toggle the freeable-only filter, keeping the cursor in range.
+    pub fn toggle_roots_filter(&mut self) {
+        self.roots_freeable_only = !self.roots_freeable_only;
+        let rows = self.root_rows();
+        // The filtered list is shorter, so a cursor near the end of the full
+        // list would otherwise point past it and select nothing.
+        self.roots_idx = self.roots_idx.min(rows.len().saturating_sub(1));
+        self.status = if self.roots_freeable_only {
+            format!("{} path(s) droppable by direnv roots alone", rows.len())
+        } else {
+            format!("{} rooted store path(s)", rows.len())
+        };
+    }
+
+    /// Toggle whether process-pinned paths are hidden, keeping the cursor sane.
+    pub fn toggle_roots_process(&mut self) {
+        self.roots_hide_process = !self.roots_hide_process;
+        let rows = self.root_rows();
+        self.roots_idx = self.roots_idx.min(rows.len().saturating_sub(1));
+        self.status = if self.roots_hide_process {
+            format!("{} path(s), process roots hidden", rows.len())
+        } else {
+            format!("{} path(s), including process-held", rows.len())
+        };
+    }
+
+    /// The row under the cursor, if any.
+    pub fn selected_root(&self) -> Option<store::RootRow> {
+        self.root_rows().into_iter().nth(self.roots_idx)
+    }
+
+    /// Total bytes held across the currently listed rows.
+    ///
+    /// Store paths are counted once each, but Nix hardlinks identical files
+    /// between them, so this is an upper bound like every other size here.
+    pub fn roots_total_bytes(&self) -> u64 {
+        self.root_rows().iter().map(|r| r.size_bytes).sum()
     }
 
     /// The version a group would converge on if selected: its newest in use.
@@ -937,7 +1063,7 @@ mod tests {
                     RootedPath {
                         store_path: sp,
                         retained_by: [PathBuf::from(*p)].into_iter().collect(),
-                        pinned_elsewhere: false,
+                        external_roots: Default::default(),
                         size_bytes: 1,
                     },
                 )
@@ -1064,7 +1190,7 @@ mod tests {
                     RootedPath {
                         store_path: sp,
                         retained_by: [PathBuf::from(*p)].into_iter().collect(),
-                        pinned_elsewhere: false,
+                        external_roots: Default::default(),
                         size_bytes: 1,
                     },
                 )
@@ -1465,5 +1591,50 @@ pub mod test_support {
             }],
         };
         App::new(vec![group], BTreeMap::new(), Vec::new(), Config::default())
+    }
+
+    /// An app with a known root set, for exercising the roots view.
+    ///
+    /// Two paths that direnv alone holds and one also pinned by a profile and a
+    /// running process, so both branches of the freeable split are covered.
+    pub fn app_with_roots() -> App {
+        use crate::store::RootedPath;
+
+        let mut roots = BTreeMap::new();
+        for (path, size, projects, external) in [
+            (
+                "/nix/store/aaa-nixpkgs-source",
+                9_000_000u64,
+                vec!["/Users/k/projects/myapp"],
+                vec![],
+            ),
+            (
+                "/nix/store/bbb-utils-source",
+                2_000_000,
+                vec!["/Users/k/projects/myapp", "/Users/k/dev/other"],
+                vec![],
+            ),
+            (
+                "/nix/store/ccc-jdk",
+                500_000,
+                vec!["/Users/k/projects/myapp"],
+                vec!["{lsof}", "/run/current-system"],
+            ),
+        ] {
+            let p = PathBuf::from(path);
+            roots.insert(
+                p.clone(),
+                RootedPath {
+                    store_path: p,
+                    retained_by: projects.iter().map(PathBuf::from).collect(),
+                    external_roots: external.iter().map(|s| s.to_string()).collect(),
+                    size_bytes: size,
+                },
+            );
+        }
+
+        let mut app = app_for_render();
+        app.roots = roots;
+        app
     }
 }

@@ -25,11 +25,35 @@ pub struct RootedPath {
     /// Projects whose `.direnv/flake-inputs` roots retain this path. Dropping
     /// all of these is within the tool's power.
     pub retained_by: BTreeSet<PathBuf>,
-    /// True when something outside direnv also holds this path: a profile, a
-    /// `result` symlink, a running process. Such a path cannot be reclaimed by
-    /// editing lockfiles, whatever we do to the direnv roots.
-    pub pinned_elsewhere: bool,
+    /// Roots outside direnv that hold this path: profiles, `result` symlinks,
+    /// running processes (`{lsof}`). Such a path cannot be reclaimed by editing
+    /// lockfiles, whatever we do to the direnv roots.
+    ///
+    /// Kept by name rather than as a flag so the roots view can answer *what*
+    /// is pinning a path, which is the question a bare bool cannot.
+    pub external_roots: BTreeSet<String>,
     pub size_bytes: u64,
+}
+
+impl RootedPath {
+    /// Whether anything outside direnv holds this path.
+    ///
+    /// Process roots count here even though the view hides them by default: a
+    /// path a process has open is genuinely not reclaimable right now, and
+    /// letting the filter reach this would make the tool overstate savings.
+    pub fn pinned_elsewhere(&self) -> bool {
+        !self.external_roots.is_empty()
+    }
+
+    /// External roots that persist: profiles, `result` symlinks, channels.
+    pub fn durable_roots(&self) -> impl Iterator<Item = &String> {
+        self.external_roots.iter().filter(|r| !is_process_root(r))
+    }
+
+    /// External roots belonging to running processes.
+    pub fn process_roots(&self) -> impl Iterator<Item = &String> {
+        self.external_roots.iter().filter(|r| is_process_root(r))
+    }
 }
 
 /// Parse one `nix-store --gc --print-roots` line: `"<root>" -> <store path>`.
@@ -53,12 +77,29 @@ fn direnv_project(root: &str) -> Option<PathBuf> {
         .then(|| PathBuf::from(project))
 }
 
+/// Whether a root is a running process rather than a durable pin.
+///
+/// The daemon censors these to `{lsof}`, `{temp:<pid>}` and `{censored}`: they
+/// name no filesystem path and vanish when the process exits, so they say
+/// nothing about whether a path is durably held. Treated separately from
+/// profiles and `result` symlinks, which persist across reboots and are the
+/// external pins actually worth reading.
+pub fn is_process_root(root: &str) -> bool {
+    root.starts_with('{') && root.ends_with('}')
+}
+
 /// Ask the Nix daemon for the authoritative GC root set.
 ///
 /// This must come from `nix-store --gc --print-roots` rather than a walk of
 /// `/nix/var/nix/gcroots/auto`: profiles, `result` symlinks and running
 /// processes also root store paths, and a scan blind to them reports paths as
 /// reclaimable when something else is still holding them.
+///
+/// Not a pure read, despite being the scan phase: `--print-roots` makes Nix
+/// prune `gcroots/auto` symlinks that already point at deleted paths, logging
+/// each to stderr. Only dangling pointers go and no repository file is touched,
+/// but this runs on every startup, so it is worth knowing that a "read-only"
+/// invocation still writes GC state.
 ///
 /// Returns an empty map if Nix is unavailable, which degrades to "no savings
 /// claimed" rather than to an overstatement.
@@ -77,7 +118,7 @@ pub fn scan_roots() -> BTreeMap<PathBuf, RootedPath> {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut retainers: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
-    let mut external: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut external: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
 
     for line in stdout.lines() {
         let Some((root, target)) = parse_root_line(line) else {
@@ -93,7 +134,7 @@ pub fn scan_roots() -> BTreeMap<PathBuf, RootedPath> {
                 retainers.entry(real).or_default().insert(project);
             }
             None => {
-                external.insert(real);
+                external.entry(real).or_default().insert(root);
             }
         }
         links.advance(1);
@@ -101,15 +142,23 @@ pub fn scan_roots() -> BTreeMap<PathBuf, RootedPath> {
     links.set(retainers.len());
     links.finish();
 
+    // Every rooted path, however it is held. Paths rooted only from outside
+    // direnv are included so the roots view can show what pins them; they still
+    // contribute nothing to `reclaimable`, which filters them out on its own.
+    let all_paths: Vec<PathBuf> = retainers
+        .keys()
+        .chain(external.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
     // Sizing dominates the scan (it walks every file of every rooted source),
     // so each unique store path is measured once, in parallel. This is also the
     // one phase slow enough to need an ETA, and the count is known up front, so
     // the estimate is a real one.
-    let sizing = Progress::new("sizing paths", Some(retainers.len()));
-    let sizes: Vec<(PathBuf, u64)> = retainers
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>()
+    let sizing = Progress::new("sizing paths", Some(all_paths.len()));
+    let sizes: Vec<(PathBuf, u64)> = all_paths
         .into_par_iter()
         .map(|p| {
             let size = dir_size(&p);
@@ -123,10 +172,10 @@ pub fn scan_roots() -> BTreeMap<PathBuf, RootedPath> {
         .into_iter()
         .map(|(path, size_bytes)| {
             let retained_by = retainers.get(&path).cloned().unwrap_or_default();
-            let pinned_elsewhere = external.contains(&path);
+            let external_roots = external.get(&path).cloned().unwrap_or_default();
             (
                 path.clone(),
-                RootedPath { store_path: path, retained_by, pinned_elsewhere, size_bytes },
+                RootedPath { store_path: path, retained_by, external_roots, size_bytes },
             )
         })
         .collect()
@@ -178,7 +227,7 @@ pub fn reclaimable(
     let mut bytes = 0;
     let mut count = 0;
     for rooted in roots.values() {
-        if rooted.pinned_elsewhere {
+        if rooted.pinned_elsewhere() {
             continue;
         }
         if !rooted.retained_by.is_empty() && rooted.retained_by.is_subset(projects) {
@@ -187,6 +236,84 @@ pub fn reclaimable(
         }
     }
     (bytes, count)
+}
+
+/// One row of the roots view: a store path and everything keeping it alive.
+///
+/// This is the inverse of `nix-store --gc --print-roots`, which lists roots and
+/// leaves you to work out what each one holds. Here the store path is the key
+/// and its retainers are the value, so "why is this still on disk" is a lookup
+/// rather than a grep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootRow {
+    pub store_path: PathBuf,
+    pub size_bytes: u64,
+    /// Projects holding this via `.direnv/flake-inputs`.
+    pub projects: Vec<PathBuf>,
+    /// Durable external roots: profiles, `result` symlinks, channels.
+    pub external: Vec<String>,
+    /// Running-process roots (`{lsof}`, `{temp:N}`).
+    ///
+    /// Separated from `external` because they are noise for the question the
+    /// view asks: a process holding a path says nothing about whether the path
+    /// is durably pinned, and on a dev machine they swamp the list.
+    pub process: Vec<String>,
+}
+
+impl RootRow {
+    /// Total number of roots holding this path, process roots included.
+    pub fn retainer_count(&self) -> usize {
+        self.projects.len() + self.external.len() + self.process.len()
+    }
+
+    /// Whether dropping direnv roots alone could free this path.
+    ///
+    /// A process root blocks this as surely as a profile does — it just stops
+    /// blocking when the process exits.
+    pub fn freeable(&self) -> bool {
+        self.external.is_empty() && self.process.is_empty() && !self.projects.is_empty()
+    }
+
+    /// Whether only a running process stands between this path and reclamation.
+    ///
+    /// Worth surfacing separately: unlike a profile, this resolves on its own.
+    pub fn blocked_only_by_process(&self) -> bool {
+        self.external.is_empty() && !self.process.is_empty() && !self.projects.is_empty()
+    }
+
+    /// Whether a running process is the *only* thing holding this path at all.
+    ///
+    /// Nothing in this tool's remit touches such a path, and with process roots
+    /// hidden the row would render with no retainers listed — an unexplained
+    /// entry, which is worse than an absent one.
+    pub fn process_only(&self) -> bool {
+        self.projects.is_empty() && self.external.is_empty() && !self.process.is_empty()
+    }
+}
+
+/// Every rooted store path with its retainers, largest first.
+///
+/// Sorted by size because the view exists to answer "what is taking up space
+/// and who is to blame", and that ordering puts the answer on the first screen.
+pub fn root_rows(roots: &BTreeMap<PathBuf, RootedPath>) -> Vec<RootRow> {
+    let mut rows: Vec<RootRow> = roots
+        .values()
+        .map(|r| RootRow {
+            store_path: r.store_path.clone(),
+            size_bytes: r.size_bytes,
+            projects: r.retained_by.iter().cloned().collect(),
+            external: r.durable_roots().cloned().collect(),
+            process: r.process_roots().cloned().collect(),
+        })
+        .collect();
+    // Ties broken by path so the ordering is stable across runs; an unstable
+    // list is unusable to navigate with a cursor.
+    rows.sort_by(|a, b| {
+        b.size_bytes
+            .cmp(&a.size_bytes)
+            .then_with(|| a.store_path.cmp(&b.store_path))
+    });
+    rows
 }
 
 pub fn human_bytes(b: u64) -> String {
@@ -215,7 +342,7 @@ mod tests {
             RootedPath {
                 store_path: p,
                 retained_by: projects.iter().map(PathBuf::from).collect(),
-                pinned_elsewhere: false,
+                external_roots: BTreeSet::new(),
                 size_bytes: size,
             },
         )
@@ -257,7 +384,7 @@ mod tests {
         // A `result` symlink or running process holds this path too, so
         // dropping the direnv root frees nothing.
         let (p, mut r) = rooted("/store/a", 500, &["/proj/b"]);
-        r.pinned_elsewhere = true;
+        r.external_roots.insert("/Users/k/projects/x/result".into());
         let roots: BTreeMap<_, _> = [(p, r)].into_iter().collect();
         let migrating: BTreeSet<PathBuf> = ["/proj/b"].iter().map(PathBuf::from).collect();
 
@@ -303,6 +430,96 @@ mod tests {
         assert!(got.contains(&PathBuf::from("/proj/b")));
         assert!(got.contains(&PathBuf::from("/proj/d")));
         assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn root_rows_are_ordered_by_size() {
+        let roots: BTreeMap<_, _> = [
+            rooted("/store/small", 10, &["/proj/a"]),
+            rooted("/store/big", 9000, &["/proj/b"]),
+            rooted("/store/mid", 500, &["/proj/c"]),
+        ]
+        .into_iter()
+        .collect();
+
+        let paths: Vec<_> = root_rows(&roots)
+            .into_iter()
+            .map(|r| r.store_path)
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("/store/big"),
+                PathBuf::from("/store/mid"),
+                PathBuf::from("/store/small"),
+            ]
+        );
+    }
+
+    #[test]
+    fn root_rows_separate_direnv_from_external_retainers() {
+        let (p, mut r) = rooted("/store/a", 100, &["/proj/b"]);
+        r.external_roots.insert("{lsof}".into());
+        r.external_roots.insert("/run/current-system".into());
+        let roots: BTreeMap<_, _> = [(p, r)].into_iter().collect();
+
+        let rows = root_rows(&roots);
+        assert_eq!(rows[0].projects, [PathBuf::from("/proj/b")]);
+        // The durable pin and the transient one are kept apart: only the former
+        // is a lasting reason the path cannot go.
+        assert_eq!(rows[0].external, ["/run/current-system"]);
+        assert_eq!(rows[0].process, ["{lsof}"]);
+        assert_eq!(rows[0].retainer_count(), 3);
+        // Something outside direnv holds it, so lockfile edits cannot free it.
+        assert!(!rows[0].freeable());
+    }
+
+    #[test]
+    fn a_path_held_only_by_a_process_is_blocked_but_not_durably() {
+        let (p, mut r) = rooted("/store/a", 100, &["/proj/b"]);
+        r.external_roots.insert("{lsof}".into());
+        let roots: BTreeMap<_, _> = [(p, r)].into_iter().collect();
+
+        let rows = root_rows(&roots);
+        assert!(!rows[0].freeable(), "a live process still pins it");
+        assert!(rows[0].blocked_only_by_process());
+    }
+
+    #[test]
+    fn temp_and_censored_roots_count_as_process_roots() {
+        // The daemon censors these differently but they are all transient.
+        assert!(is_process_root("{lsof}"));
+        assert!(is_process_root("{temp:89776}"));
+        assert!(is_process_root("{censored}"));
+        // Real paths are not.
+        assert!(!is_process_root("/run/current-system"));
+        assert!(!is_process_root("/Users/k/projects/x/result"));
+    }
+
+    #[test]
+    fn a_durably_pinned_path_is_not_merely_process_blocked() {
+        let (p, mut r) = rooted("/store/a", 100, &["/proj/b"]);
+        r.external_roots.insert("/run/current-system".into());
+        r.external_roots.insert("{lsof}".into());
+        let roots: BTreeMap<_, _> = [(p, r)].into_iter().collect();
+
+        // The profile outlives the process, so hiding process roots must not
+        // make this look reclaimable.
+        assert!(!root_rows(&roots)[0].blocked_only_by_process());
+    }
+
+    #[test]
+    fn a_purely_direnv_path_is_freeable() {
+        let roots: BTreeMap<_, _> =
+            [rooted("/store/a", 100, &["/proj/b", "/proj/c"])].into_iter().collect();
+        assert!(root_rows(&roots)[0].freeable());
+    }
+
+    #[test]
+    fn an_unrooted_path_is_not_freeable() {
+        // Nothing holds it, so there is no root to drop and nothing to free.
+        let roots: BTreeMap<_, _> = [rooted("/store/a", 100, &[])].into_iter().collect();
+        assert!(!root_rows(&roots)[0].freeable());
     }
 
     #[test]
