@@ -4,8 +4,12 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{fit_names, short, App, Mode, Pane};
+use crate::progress::human_duration;
 use crate::store::human_bytes;
 use crate::sync;
+
+/// Width of the execution progress bar, matching the startup scan's.
+const BAR_WIDTH: usize = 24;
 
 pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::vertical([
@@ -20,6 +24,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     match app.mode {
         Mode::Browse => draw_browse(f, chunks[1], app),
         Mode::Confirm => draw_confirm(f, chunks[1], app),
+        Mode::Running => draw_running(f, chunks[1], app),
         Mode::Report => draw_report(f, chunks[1], app),
     }
 
@@ -27,6 +32,29 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
+    // Mid-run the browse-mode counts describe a state the user has already left,
+    // and `estimated_savings` is about a plan that is currently being applied.
+    // The header becomes what the run is, instead.
+    if let (Mode::Running, Some(r)) = (app.mode, &app.running) {
+        let line = Line::from(vec![
+            Span::styled("flake-syncer", Style::new().bold().fg(Color::Cyan)),
+            Span::raw("  "),
+            Span::styled("applying plan", Style::new().fg(Color::Yellow).bold()),
+            Span::raw("  "),
+            Span::raw(format!("{}/{} step(s)", r.done, r.total)),
+            Span::raw("  "),
+            Span::styled(
+                human_duration(r.started.elapsed()),
+                Style::new().fg(Color::DarkGray),
+            ),
+        ]);
+        f.render_widget(
+            Paragraph::new(line).block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+        return;
+    }
+
     let (bytes, paths) = app.estimated_savings();
     let line = Line::from(vec![
         Span::styled("flake-syncer", Style::new().bold().fg(Color::Cyan)),
@@ -581,6 +609,106 @@ mod tests {
     }
 }
 
+/// Live progress while the plan runs.
+///
+/// Each `nix flake update` blocks for seconds, so this screen has to answer
+/// three questions at a glance: how far along, what is happening right now, and
+/// whether anything has failed. The step in flight is named explicitly —
+/// a bar that sits still for ten seconds is indistinguishable from a hang
+/// unless the screen says what it is waiting on.
+fn draw_running(f: &mut Frame, area: Rect, app: &App) {
+    let Some(r) = &app.running else {
+        return;
+    };
+
+    let filled = (r.fraction() * BAR_WIDTH as f64).round() as usize;
+    let bar: String = "█".repeat(filled) + &"░".repeat(BAR_WIDTH.saturating_sub(filled));
+    let failures = r.failures();
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(bar, Style::new().fg(Color::Green)),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:>3}%", (r.fraction() * 100.0) as usize),
+                Style::new().bold(),
+            ),
+            Span::raw("  "),
+            Span::raw(format!("{}/{}", r.done, r.total)),
+            Span::raw("  "),
+            Span::styled(
+                human_duration(r.started.elapsed()),
+                Style::new().fg(Color::DarkGray),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                r.eta()
+                    .map(|d| format!("ETA {}", human_duration(d)))
+                    .unwrap_or_default(),
+                Style::new().fg(Color::DarkGray),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                if failures > 0 {
+                    format!("{failures} failed")
+                } else {
+                    String::new()
+                },
+                Style::new().fg(Color::Red).bold(),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    // What is blocking right now, named so a long pause is legible.
+    match &r.current {
+        Some((step, project, input)) => {
+            let mut spans = vec![
+                Span::styled("▶ ", Style::new().fg(Color::Cyan).bold()),
+                Span::styled(step.label(), Style::new().fg(Color::Cyan)),
+                Span::raw("  "),
+                Span::raw(project.display().to_string()),
+            ];
+            if !input.is_empty() {
+                spans.push(Span::styled(
+                    format!("  [{input}]"),
+                    Style::new().fg(Color::DarkGray),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+        None => lines.push(Line::from(Span::styled(
+            "  working…",
+            Style::new().fg(Color::DarkGray),
+        ))),
+    }
+    lines.push(Line::from(""));
+
+    // Completed steps, most recent last, trimmed to what fits so the newest
+    // stays on screen without scrolling.
+    let room = (area.height as usize).saturating_sub(lines.len() + 3);
+    let shown = r.log.iter().filter(|o| !o.text.is_empty()).rev().take(room);
+    let mut recent: Vec<&crate::app::Outcome> = shown.collect();
+    recent.reverse();
+    for o in recent {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", o.text),
+            if o.ok {
+                Style::new().fg(Color::Green)
+            } else {
+                Style::new().fg(Color::Red)
+            },
+        )));
+    }
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" running ")),
+        area,
+    );
+}
+
 fn draw_report(f: &mut Frame, area: Rect, app: &App) {
     let lines: Vec<Line> = app
         .report
@@ -615,10 +743,16 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             if app.rooted_only { "+unrooted" } else { "rooted only" },
         ),
         Mode::Confirm => "Enter run  Esc cancel  ↑↓ scroll  e edit  q quit".to_string(),
+        // No keys: the run blocks until it finishes, and offering an abort we
+        // cannot honour mid-`nix`-invocation would be a lie.
+        Mode::Running => "running — please wait".to_string(),
         Mode::Report => "q quit".to_string(),
     };
     let mut spans = vec![Span::styled(keys, Style::new().fg(Color::DarkGray))];
-    if !app.status.is_empty() {
+    // The status line carries browse-mode feedback ("target set to…"), which is
+    // stale once a run starts and would sit next to the progress bar as if it
+    // described it.
+    if !app.status.is_empty() && app.mode != Mode::Running {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(app.status.clone(), Style::new().fg(Color::Cyan)));
     }
@@ -664,3 +798,70 @@ fn format_date(ts: i64) -> String {
 fn leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use crate::app::{Running, Step};
+    use ratatui::backend::TestBackend;
+
+    /// Render the running screen into a test terminal and return it as text.
+    fn render(app: &App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn running_app() -> App {
+        let mut app = crate::app::test_support::app_for_render();
+        let mut r = Running::new(4);
+        r.done = 1;
+        r.current = Some((
+            Step::Updating,
+            std::path::PathBuf::from("/Users/k/projects/myapp"),
+            "nixpkgs".into(),
+        ));
+        r.log.push(crate::app::Outcome { ok: true, text: "ok    /Users/k/projects/a nixpkgs".into() });
+        r.log.push(crate::app::Outcome { ok: false, text: "fail  /Users/k/projects/b: boom".into() });
+        app.running = Some(r);
+        app.mode = Mode::Running;
+        app
+    }
+
+    #[test]
+    fn the_running_screen_names_what_is_blocking() {
+        let out = render(&running_app(), 100, 24);
+        assert!(out.contains("running"), "{out}");
+        // The step in flight, named — a still bar must be distinguishable
+        // from a hang.
+        assert!(out.contains("nix flake update"), "{out}");
+        assert!(out.contains("myapp"), "{out}");
+        assert!(out.contains("[nixpkgs]"), "{out}");
+    }
+
+    #[test]
+    fn the_running_screen_shows_counts_and_failures() {
+        let out = render(&running_app(), 100, 24);
+        assert!(out.contains("1/4"), "{out}");
+        assert!(out.contains("25%"), "{out}");
+        assert!(out.contains("1 failed"), "{out}");
+        // Completed steps stay visible while the next one runs.
+        assert!(out.contains("boom"), "{out}");
+    }
+
+    #[test]
+    fn a_narrow_terminal_still_renders() {
+        // Must not panic on a small area; the log simply gets less room.
+        let out = render(&running_app(), 40, 10);
+        assert!(out.contains("running"), "{out}");
+    }
+}
+

@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use app::{App, Mode};
 use crossterm::terminal::{Clear, ClearType};
+use progress::human_duration;
 use store::human_bytes;
 
 fn main() -> Result<()> {
@@ -190,7 +191,7 @@ fn event_loop(term: &mut Term, app: &mut App) -> Result<()> {
                 _ => {}
             },
             Mode::Confirm => match key.code {
-                KeyCode::Enter => execute_plan(app),
+                KeyCode::Enter => execute_plan(term, app),
                 KeyCode::Esc => app.cancel(),
                 KeyCode::Up | KeyCode::Char('k') => app.scroll_details(-1),
                 KeyCode::Down | KeyCode::Char('j') => app.scroll_details(1),
@@ -200,6 +201,11 @@ fn event_loop(term: &mut Term, app: &mut App) -> Result<()> {
                 KeyCode::Char('q') => break,
                 _ => {}
             },
+            // Only reachable if a key was buffered while the plan ran, since
+            // `execute_plan` blocks until it leaves this mode. Ignored rather
+            // than acted on: a keystroke typed during a long update should not
+            // be replayed against whatever screen follows it.
+            Mode::Running => {}
             Mode::Report => {
                 if matches!(key.code, KeyCode::Char('q') | KeyCode::Enter | KeyCode::Esc) {
                     break;
@@ -259,11 +265,20 @@ fn open_in_editor(term: &mut Term, app: &mut App) -> Result<()> {
     Ok(())
 }
 
+/// Draw one frame mid-execution.
+///
+/// Each action blocks for as long as `nix` takes, so the screen is only
+/// repainted between steps; a draw failure here is cosmetic and must not
+/// abandon a plan that is already half-applied.
+fn redraw(term: &mut Term, app: &App) {
+    let _ = term.draw(|f| ui::draw(f, app));
+}
+
 /// Run the staged actions, then drop direnv roots for projects we changed.
 ///
 /// Roots are only dropped for projects where every action succeeded; a project
 /// whose update failed still needs its current inputs.
-fn execute_plan(app: &mut App) {
+fn execute_plan(term: &mut Term, app: &mut App) {
     let mut report = Vec::new();
     let mut touched: BTreeSet<std::path::PathBuf> = BTreeSet::new();
     let mut failed: BTreeSet<std::path::PathBuf> = BTreeSet::new();
@@ -271,66 +286,115 @@ fn execute_plan(app: &mut App) {
     // Take the plan out so `app` can be borrowed immutably for the previews.
     let pending = std::mem::take(&mut app.pending);
 
+    // Projects that will need their roots dropped, counted up front so the
+    // progress bar's denominator covers the whole run rather than growing.
+    let will_drop: BTreeSet<&std::path::PathBuf> =
+        pending.iter().map(|a| &a.project).collect();
+    app.begin_running(will_drop.len());
+    redraw(term, app);
+
     for action in &pending {
         // A ref change edits flake.nix first: the lockfile is resolved against
         // whatever the file declares, so it has to be right before nix runs.
         if action.changes_ref() {
-            let Some(edit) = app.edit_for(&action.project, &action.input_name) else {
-                report.push(format!(
+            app.step_started(app::Step::Editing, &action.project, &action.input_name);
+            redraw(term, app);
+
+            let Some(edit) = app.edit_for(&action.project, &action.input_name).cloned() else {
+                let msg = format!(
                     "fail  {} [{}]: flake.nix could not be rewritten, skipped",
                     action.project.display(),
                     action.input_name
-                ));
+                );
+                report.push(msg.clone());
+                app.step_finished(false, msg, true);
                 failed.insert(action.project.clone());
+                redraw(term, app);
                 continue;
             };
-            match nix_edit::apply_edit(edit) {
+            match nix_edit::apply_edit(&edit) {
                 Ok(backup) => {
-                    report.push(format!(
+                    let msg = format!(
                         "ok    {} [{}] url {} → {}  (backup: {})",
                         edit.path.display(),
                         action.input_name,
                         edit.from_url,
                         edit.to_url,
                         backup.display()
-                    ));
+                    );
+                    report.push(msg.clone());
                     // Show the edit exactly as it landed, not as it was planned.
                     let applied = diff::unified(&edit.path, &edit.before, &edit.after);
                     for line in diff::render(&applied, &app.config.differ).lines() {
                         report.push(format!("      {line}"));
                     }
+                    // The edit shares this action's slot with the update that
+                    // follows it, so it is logged without advancing the count.
+                    app.step_finished(true, msg, false);
                 }
                 Err(e) => {
-                    report.push(format!("fail  {}: {e}", edit.path.display()));
+                    let msg = format!("fail  {}: {e}", edit.path.display());
+                    report.push(msg.clone());
+                    app.step_finished(false, msg, true);
                     failed.insert(action.project.clone());
+                    redraw(term, app);
                     continue;
                 }
             }
         }
 
+        app.step_started(app::Step::Updating, &action.project, &action.input_name);
+        redraw(term, app);
+
         match sync::apply(action) {
             Ok(()) => {
-                report.push(format!(
+                let msg = format!(
                     "ok    {} {} → {}",
                     action.project.display(),
                     action.input_name,
                     app::short(&action.target_version)
-                ));
+                );
+                report.push(msg.clone());
+                app.step_finished(true, msg, true);
                 touched.insert(action.project.clone());
             }
             Err(e) => {
-                report.push(format!("fail  {}: {e}", action.project.display()));
+                let msg = format!("fail  {}: {e}", action.project.display());
+                report.push(msg.clone());
+                app.step_finished(false, msg, true);
                 failed.insert(action.project.clone());
             }
         }
+        redraw(term, app);
     }
 
     let mut dropped = 0;
-    for project in touched.difference(&failed) {
-        match sync::drop_direnv_roots(project) {
-            Ok(n) => dropped += n,
-            Err(e) => report.push(format!("fail  dropping roots in {}: {e}", project.display())),
+    for project in will_drop {
+        if !touched.contains(project) || failed.contains(project) {
+            // Counted in the total, so it must still be accounted for even
+            // though there is nothing to do.
+            app.step_finished(true, String::new(), true);
+            continue;
         }
+        app.step_started(app::Step::DroppingRoots, project, "");
+        redraw(term, app);
+
+        match sync::drop_direnv_roots(project) {
+            Ok(n) => {
+                dropped += n;
+                app.step_finished(
+                    true,
+                    format!("ok    dropped {n} root(s) in {}", project.display()),
+                    true,
+                );
+            }
+            Err(e) => {
+                let msg = format!("fail  dropping roots in {}: {e}", project.display());
+                report.push(msg.clone());
+                app.step_finished(false, msg, true);
+            }
+        }
+        redraw(term, app);
     }
 
     report.push(String::new());
@@ -352,7 +416,28 @@ fn execute_plan(app: &mut App) {
         ));
     }
 
+    // How long the whole run took, which is the one number the report was
+    // missing and the reason the wait felt unbounded.
+    if let Some(r) = &app.running {
+        let failures = r.failures();
+        report.insert(
+            0,
+            format!(
+                "{} action(s) in {}{}",
+                r.total,
+                human_duration(r.started.elapsed()),
+                if failures > 0 {
+                    format!(", {failures} failed")
+                } else {
+                    String::new()
+                }
+            ),
+        );
+        report.insert(1, String::new());
+    }
+
     app.report = report;
     app.pending_diffs.clear();
+    app.running = None;
     app.mode = Mode::Report;
 }

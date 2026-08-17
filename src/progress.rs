@@ -156,7 +156,9 @@ fn eta(elapsed: Duration, done: usize, total: usize) -> String {
     format!("ETA {}", human_duration(remaining))
 }
 
-fn human_duration(d: Duration) -> String {
+/// Compact duration, shared with the TUI's running display so elapsed times
+/// read the same whether they come from the scan or from an executing plan.
+pub fn human_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs >= 60 {
         format!("{}m{:02}s", secs / 60, secs % 60)

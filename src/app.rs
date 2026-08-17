@@ -94,8 +94,98 @@ pub enum Mode {
     Browse,
     /// Showing the commands that would run, awaiting confirm.
     Confirm,
+    /// Actions are running; showing live progress.
+    ///
+    /// A plan can be dozens of `nix flake update` invocations, each taking
+    /// seconds, so without this the TUI would sit frozen on the confirm screen
+    /// for minutes and look hung.
+    Running,
     /// Actions have run; showing the outcome.
     Report,
+}
+
+/// What an action is doing right now, for the running display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Rewriting `flake.nix` — fast, local, no network.
+    Editing,
+    /// `nix flake update` — the slow part, and usually network-bound.
+    Updating,
+    /// Removing a project's stale direnv GC roots.
+    DroppingRoots,
+}
+
+impl Step {
+    pub fn label(self) -> &'static str {
+        match self {
+            Step::Editing => "editing flake.nix",
+            Step::Updating => "nix flake update",
+            Step::DroppingRoots => "dropping GC roots",
+        }
+    }
+}
+
+/// Live state of an executing plan.
+///
+/// Held on `App` so rendering stays a pure function of state: the execute loop
+/// updates this and asks for a redraw, and `ui` reads it like anything else.
+#[derive(Debug, Clone)]
+pub struct Running {
+    /// Total units of work: one per action, plus one per project whose roots
+    /// are dropped at the end.
+    pub total: usize,
+    pub done: usize,
+    /// What is happening right now, if anything.
+    pub current: Option<(Step, PathBuf, String)>,
+    pub started: std::time::Instant,
+    /// Outcomes so far, newest last. Mirrors what ends up in the report.
+    pub log: Vec<Outcome>,
+}
+
+/// One completed step's result, kept structured so the UI can style it.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    pub ok: bool,
+    pub text: String,
+}
+
+impl Running {
+    pub fn new(total: usize) -> Self {
+        Running {
+            total,
+            done: 0,
+            current: None,
+            started: std::time::Instant::now(),
+            log: Vec::new(),
+        }
+    }
+
+    pub fn fraction(&self) -> f64 {
+        if self.total == 0 {
+            1.0
+        } else {
+            (self.done as f64 / self.total as f64).clamp(0.0, 1.0)
+        }
+    }
+
+    pub fn failures(&self) -> usize {
+        self.log.iter().filter(|o| !o.ok).count()
+    }
+
+    /// Remaining time, extrapolated from the average rate so far.
+    ///
+    /// Blank until something has finished: `nix flake update` timings vary by
+    /// an order of magnitude depending on what is already in the store, so an
+    /// estimate from zero samples would be actively misleading.
+    pub fn eta(&self) -> Option<std::time::Duration> {
+        if self.done == 0 || self.done >= self.total {
+            return None;
+        }
+        let per = self.started.elapsed().as_secs_f64() / self.done as f64;
+        Some(std::time::Duration::from_secs_f64(
+            per * (self.total - self.done) as f64,
+        ))
+    }
 }
 
 /// A `flake.nix` edit, rendered for review.
@@ -161,6 +251,8 @@ pub struct App {
     /// are applied so nothing changes on disk unseen.
     pub pending_diffs: Vec<EditPreview>,
     pub report: Vec<String>,
+    /// Live progress while a plan executes; `None` outside `Mode::Running`.
+    pub running: Option<Running>,
     pub status: String,
     /// Scan configuration, carried for the configurable differ and editor.
     pub config: Config,
@@ -193,6 +285,7 @@ impl App {
             pending: Vec::new(),
             pending_diffs: Vec::new(),
             report: Vec::new(),
+            running: None,
             status: String::new(),
             config,
             details_scroll: 0,
@@ -765,6 +858,35 @@ impl App {
         self.pending_diffs.iter().filter(|p| p.is_error()).collect()
     }
 
+    /// Enter `Mode::Running` with a work total to count against.
+    ///
+    /// `extra` covers the post-update root dropping, which is real work the
+    /// user waits on and so must be part of the denominator — a bar that hits
+    /// 100% and then keeps going is worse than no bar.
+    pub fn begin_running(&mut self, extra: usize) {
+        self.running = Some(Running::new(self.pending.len() + extra));
+        self.mode = Mode::Running;
+    }
+
+    /// Note what is starting, so the display can name it while it blocks.
+    pub fn step_started(&mut self, step: Step, project: &std::path::Path, input: &str) {
+        if let Some(r) = &mut self.running {
+            r.current = Some((step, project.to_path_buf(), input.to_string()));
+        }
+    }
+
+    /// Record a finished step. `counts` is false for sub-steps that share an
+    /// action's slot in the total, such as the edit that precedes an update.
+    pub fn step_finished(&mut self, ok: bool, text: String, counts: bool) {
+        if let Some(r) = &mut self.running {
+            r.log.push(Outcome { ok, text });
+            if counts {
+                r.done += 1;
+            }
+            r.current = None;
+        }
+    }
+
     pub fn cancel(&mut self) {
         self.pending.clear();
         self.pending_diffs.clear();
@@ -1155,6 +1277,95 @@ mod tests {
     }
 
     #[test]
+    fn the_bar_accounts_for_root_dropping_too() {
+        // Root dropping is real work the user waits on. If it were outside the
+        // total, the bar would reach 100% and then keep going.
+        let mut app = app_with(vec![pin("/a", "nixpkgs", "one", true)], &["/a"]);
+        app.pending = vec![sync::action_for(
+            &app.groups[0],
+            &app.groups[0].pins[0],
+            "two",
+        )];
+        app.begin_running(1);
+
+        let r = app.running.as_ref().unwrap();
+        assert_eq!(r.total, 2, "one action plus one root drop");
+        assert_eq!(r.done, 0);
+        assert_eq!(app.mode, Mode::Running);
+    }
+
+    #[test]
+    fn an_edit_shares_its_actions_slot_with_the_update() {
+        // The flake.nix edit and the update that follows are one action; if the
+        // edit advanced the counter the bar would overshoot its total.
+        let mut app = app_with(vec![pin("/a", "nixpkgs", "one", true)], &["/a"]);
+        app.pending = vec![sync::action_for(
+            &app.groups[0],
+            &app.groups[0].pins[0],
+            "two",
+        )];
+        app.begin_running(0);
+
+        app.step_finished(true, "edited".into(), false);
+        assert_eq!(app.running.as_ref().unwrap().done, 0, "the edit does not count");
+        app.step_finished(true, "updated".into(), true);
+        assert_eq!(app.running.as_ref().unwrap().done, 1);
+        assert_eq!(app.running.as_ref().unwrap().fraction(), 1.0);
+    }
+
+    #[test]
+    fn failures_are_counted_and_the_run_continues() {
+        // One project failing must not stop the rest: the log records it and
+        // the count still advances, so the bar reflects work attempted.
+        let mut app = app_with(vec![pin("/a", "nixpkgs", "one", true)], &["/a"]);
+        app.pending.clear();
+        app.begin_running(3);
+
+        app.step_finished(true, "ok a".into(), true);
+        app.step_finished(false, "fail b".into(), true);
+        app.step_finished(true, "ok c".into(), true);
+
+        let r = app.running.as_ref().unwrap();
+        assert_eq!(r.done, 3);
+        assert_eq!(r.failures(), 1);
+        assert_eq!(r.log.len(), 3);
+    }
+
+    #[test]
+    fn the_current_step_is_cleared_when_it_finishes() {
+        // A stale "▶ updating X" left on screen after X completed would name
+        // the wrong project during the next one's wait.
+        let mut app = app_with(vec![pin("/a", "nixpkgs", "one", true)], &["/a"]);
+        app.pending.clear();
+        app.begin_running(1);
+
+        app.step_started(Step::Updating, std::path::Path::new("/a"), "nixpkgs");
+        let cur = app.running.as_ref().unwrap().current.clone();
+        assert_eq!(cur.unwrap().0, Step::Updating);
+
+        app.step_finished(true, "done".into(), true);
+        assert!(app.running.as_ref().unwrap().current.is_none());
+    }
+
+    #[test]
+    fn eta_waits_for_a_sample() {
+        // nix update times vary by an order of magnitude depending on what is
+        // already in the store, so an estimate from zero samples would mislead.
+        let mut r = Running::new(4);
+        assert_eq!(r.eta(), None, "no ETA before anything finishes");
+        r.done = 4;
+        assert_eq!(r.eta(), None, "no ETA once complete");
+        r.done = 2;
+        assert!(r.eta().is_some(), "an ETA once there is a rate to use");
+    }
+
+    #[test]
+    fn an_empty_plan_is_complete_not_divided_by_zero() {
+        let r = Running::new(0);
+        assert_eq!(r.fraction(), 1.0);
+    }
+
+    #[test]
     fn identity_url_round_trips_the_declared_ref() {
         let with_ref = Identity {
             kind: "github".into(),
@@ -1228,3 +1439,31 @@ pub fn short(version: &str) -> String {
 }
 
 
+
+/// Constructors used by `ui`'s render tests, which need a populated `App`.
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+    use crate::lock::{Group, Identity};
+
+    pub fn app_for_render() -> App {
+        let identity = Identity {
+            kind: "github".into(),
+            owner: "nixos".into(),
+            repo: "nixpkgs".into(),
+            git_ref: "nixpkgs-unstable".into(),
+        };
+        let group = Group {
+            identity,
+            pins: vec![Pin {
+                project: "/Users/k/projects/myapp".into(),
+                input_name: "nixpkgs".into(),
+                version: "abc123".into(),
+                last_modified: Some(1),
+                direct: true,
+                declared_name: Some("nixpkgs".into()),
+            }],
+        };
+        App::new(vec![group], BTreeMap::new(), Vec::new(), Config::default())
+    }
+}
