@@ -1,5 +1,7 @@
 mod app;
+mod diff;
 mod lock;
+mod nix_edit;
 mod progress;
 mod scan;
 mod store;
@@ -16,6 +18,7 @@ use std::io::stdout;
 use std::time::Duration;
 
 use app::{App, Mode};
+use crossterm::terminal::{Clear, ClearType};
 use store::human_bytes;
 
 fn main() -> Result<()> {
@@ -50,7 +53,7 @@ fn main() -> Result<()> {
     let rooted_only = !std::env::args().any(|a| a == "--all-projects");
 
     let roots = store::scan_roots();
-    let mut app = App::new(groups, roots, parse_errors);
+    let mut app = App::new(groups, roots, parse_errors, cfg);
     app.rooted_only = rooted_only;
 
     if report_only {
@@ -79,6 +82,43 @@ fn print_report(app: &App, lock_count: usize) -> Result<()> {
             app.actionable_pins(g).count(),
             g.identity
         );
+    }
+
+    // Refs of one repo that merging could combine. These are never divergent
+    // groups on their own, so without this they are invisible in the report —
+    // and they are the reason the merge feature exists.
+    let mut by_repo: std::collections::BTreeMap<lock::MergeKey, Vec<&lock::Group>> =
+        std::collections::BTreeMap::new();
+    for g in &app.groups {
+        by_repo.entry(g.identity.merge_key()).or_default().push(g);
+    }
+    // A ref with no actionable pins in the current scope is not something the
+    // user can merge, so listing it would advertise an action that does nothing.
+    let mergeable: Vec<Vec<&lock::Group>> = by_repo
+        .values()
+        .map(|v| {
+            v.iter()
+                .copied()
+                .filter(|g| app.actionable_pins(g).next().is_some())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| v.len() > 1)
+        .collect();
+    if !mergeable.is_empty() {
+        println!("\n{} repo(s) declared under more than one ref:", mergeable.len());
+        for groups in &mergeable {
+            let total: usize = groups.iter().map(|g| app.actionable_pins(g).count()).sum();
+            println!("  {} refs, {total} pins:", groups.len());
+            for g in groups.iter() {
+                println!(
+                    "    {:>2} revs across {:>2} pins  {}",
+                    app.distinct_versions(g),
+                    app.actionable_pins(g).count(),
+                    g.identity
+                );
+            }
+        }
+        println!("  (merge them in the TUI with m/M — this rewrites flake.nix)");
     }
 
     let all: BTreeSet<_> = app
@@ -142,6 +182,9 @@ fn event_loop(term: &mut Term, app: &mut App) -> Result<()> {
                 KeyCode::Char('A') => app.select_all_suggested(),
                 KeyCode::Char('N') => app.select_none(),
                 KeyCode::Char('g') => app.toggle_rooted_only(),
+                KeyCode::Char('m') => app.toggle_merge_mark(),
+                KeyCode::Char('M') => app.commit_merge(),
+                KeyCode::Char('e') => open_in_editor(term, app)?,
                 KeyCode::PageDown => app.scroll_details(1),
                 KeyCode::PageUp => app.scroll_details(-1),
                 _ => {}
@@ -149,6 +192,11 @@ fn event_loop(term: &mut Term, app: &mut App) -> Result<()> {
             Mode::Confirm => match key.code {
                 KeyCode::Enter => execute_plan(app),
                 KeyCode::Esc => app.cancel(),
+                KeyCode::Up | KeyCode::Char('k') => app.scroll_details(-1),
+                KeyCode::Down | KeyCode::Char('j') => app.scroll_details(1),
+                // The plan lists projects this tool will not rewrite; `e` opens
+                // the first of them so they can be fixed by hand.
+                KeyCode::Char('e') => open_in_editor(term, app)?,
                 KeyCode::Char('q') => break,
                 _ => {}
             },
@@ -162,6 +210,55 @@ fn event_loop(term: &mut Term, app: &mut App) -> Result<()> {
     Ok(())
 }
 
+/// Which `flake.nix` the `e` key should open.
+///
+/// In the confirm view the interesting file is one the tool refused to rewrite —
+/// that is the case needing hands. Otherwise it is the highlighted project.
+fn editor_target(app: &App) -> Option<std::path::PathBuf> {
+    if app.mode == Mode::Confirm {
+        if let Some(p) = app.unwritable().first() {
+            return Some(p.project.join("flake.nix"));
+        }
+    }
+    app.selected_version_row()
+        .and_then(|r| r.pins.first().map(|p| p.project.join("flake.nix")))
+}
+
+/// Hand the terminal to the configured editor, then take it back.
+///
+/// The TUI owns the alternate screen and raw mode, so both are released before
+/// the child starts and restored after it exits — otherwise the editor draws
+/// into a screen it does not control and leaves the terminal unusable.
+fn open_in_editor(term: &mut Term, app: &mut App) -> Result<()> {
+    let Some(path) = editor_target(app) else {
+        app.status = "nothing to open".into();
+        return Ok(());
+    };
+    let cmd = app.config.editor_command();
+    let Some((program, args)) = cmd.split_first() else {
+        app.status = "no editor configured".into();
+        return Ok(());
+    };
+
+    disable_raw_mode()?;
+    execute!(term.backend_mut(), LeaveAlternateScreen)?;
+
+    let status = std::process::Command::new(program)
+        .args(args)
+        .arg(&path)
+        .status();
+
+    enable_raw_mode()?;
+    execute!(term.backend_mut(), EnterAlternateScreen, Clear(ClearType::All))?;
+    term.clear()?;
+
+    app.status = match status {
+        Ok(_) => format!("edited {} — rescan (q, then rerun) to pick up changes", path.display()),
+        Err(e) => format!("could not launch {program}: {e}"),
+    };
+    Ok(())
+}
+
 /// Run the staged actions, then drop direnv roots for projects we changed.
 ///
 /// Roots are only dropped for projects where every action succeeded; a project
@@ -171,7 +268,46 @@ fn execute_plan(app: &mut App) {
     let mut touched: BTreeSet<std::path::PathBuf> = BTreeSet::new();
     let mut failed: BTreeSet<std::path::PathBuf> = BTreeSet::new();
 
-    for action in &app.pending {
+    // Take the plan out so `app` can be borrowed immutably for the previews.
+    let pending = std::mem::take(&mut app.pending);
+
+    for action in &pending {
+        // A ref change edits flake.nix first: the lockfile is resolved against
+        // whatever the file declares, so it has to be right before nix runs.
+        if action.changes_ref() {
+            let Some(edit) = app.edit_for(&action.project, &action.input_name) else {
+                report.push(format!(
+                    "fail  {} [{}]: flake.nix could not be rewritten, skipped",
+                    action.project.display(),
+                    action.input_name
+                ));
+                failed.insert(action.project.clone());
+                continue;
+            };
+            match nix_edit::apply_edit(edit) {
+                Ok(backup) => {
+                    report.push(format!(
+                        "ok    {} [{}] url {} → {}  (backup: {})",
+                        edit.path.display(),
+                        action.input_name,
+                        edit.from_url,
+                        edit.to_url,
+                        backup.display()
+                    ));
+                    // Show the edit exactly as it landed, not as it was planned.
+                    let applied = diff::unified(&edit.path, &edit.before, &edit.after);
+                    for line in diff::render(&applied, &app.config.differ).lines() {
+                        report.push(format!("      {line}"));
+                    }
+                }
+                Err(e) => {
+                    report.push(format!("fail  {}: {e}", edit.path.display()));
+                    failed.insert(action.project.clone());
+                    continue;
+                }
+            }
+        }
+
         match sync::apply(action) {
             Ok(()) => {
                 report.push(format!(
@@ -201,8 +337,22 @@ fn execute_plan(app: &mut App) {
     report.push(format!(
         "Dropped {dropped} direnv GC root(s). Run `nix store gc` to reclaim the space."
     ));
+    // The backups are the undo path for every flake.nix touched here, so say
+    // they exist rather than leaving them to be discovered.
+    let edited: Vec<String> = pending
+        .iter()
+        .filter(|a| a.changes_ref())
+        .filter_map(|a| app.edit_for(&a.project, &a.input_name))
+        .map(|e| nix_edit::backup_path(&e.path).display().to_string())
+        .collect();
+    if !edited.is_empty() {
+        report.push(format!(
+            "{} flake.nix backup(s) kept alongside the originals (.nix.bak).",
+            edited.len()
+        ));
+    }
 
     app.report = report;
-    app.pending.clear();
+    app.pending_diffs.clear();
     app.mode = Mode::Report;
 }

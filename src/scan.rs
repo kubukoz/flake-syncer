@@ -21,10 +21,60 @@ pub struct Config {
     /// makes `talks/nix-scala-folks` work without spelling out `$HOME`.
     #[serde(default)]
     pub ignore: Vec<PathBuf>,
+
+    /// Command that renders a unified diff, receiving it on stdin.
+    ///
+    /// Every `flake.nix` edit is shown as a diff before and after it is applied,
+    /// so nothing changes on disk that the user has not seen. `delta` is the
+    /// default; anything reading a diff from stdin works, and an empty list
+    /// falls back to plain built-in output.
+    #[serde(default = "default_differ")]
+    pub differ: Vec<String>,
+
+    /// Command used to open a file for manual editing, with the path appended.
+    ///
+    /// Used for the flakes this tool refuses to rewrite automatically: rather
+    /// than guess at an unfamiliar `inputs` layout, it hands the file over.
+    #[serde(default = "default_editor")]
+    pub editor: Vec<String>,
 }
 
 fn default_depth() -> usize {
     4
+}
+
+/// `delta`, configured for capture rather than for a terminal it owns.
+///
+/// `--paging=never` stops it blocking on a pager, and `--color-only` keeps it
+/// from drawing file headers and box-drawing rules that assume a full-width
+/// terminal — the TUI supplies its own framing and re-colours each line from its
+/// diff marker, so what is wanted here is the diff text, not delta's chrome.
+fn default_differ() -> Vec<String> {
+    vec![
+        "delta".into(),
+        "--paging=never".into(),
+        "--color-only".into(),
+    ]
+}
+
+fn default_editor() -> Vec<String> {
+    vec!["nvim".into()]
+}
+
+impl Config {
+    /// The editor to use, preferring `$VISUAL`/`$EDITOR` when the config still
+    /// holds the default — an explicitly configured editor always wins.
+    pub fn editor_command(&self) -> Vec<String> {
+        if self.editor != default_editor() {
+            return self.editor.clone();
+        }
+        std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.split_whitespace().map(String::from).collect())
+            .unwrap_or_else(default_editor)
+    }
 }
 
 /// Whether `project` is excluded by any `ignore` entry.
@@ -48,7 +98,13 @@ impl Default for Config {
         let roots = home
             .map(|h| vec![h.join("dev"), h.join("projects"), h.join(".nixpkgs")])
             .unwrap_or_default();
-        Config { roots, max_depth: default_depth(), ignore: Vec::new() }
+        Config {
+            roots,
+            max_depth: default_depth(),
+            ignore: Vec::new(),
+            differ: default_differ(),
+            editor: default_editor(),
+        }
     }
 }
 
@@ -127,6 +183,35 @@ mod tests {
     #[test]
     fn empty_ignore_matches_nothing() {
         assert!(!is_ignored(std::path::Path::new("/anything"), &[]));
+    }
+
+    #[test]
+    fn an_explicit_editor_beats_the_environment() {
+        // Someone who wrote an editor into the config meant it, whatever their
+        // shell exports.
+        let cfg = Config { editor: vec!["emacs".into()], ..Config::default() };
+        assert_eq!(cfg.editor_command(), vec!["emacs".to_string()]);
+    }
+
+    #[test]
+    fn a_multi_word_env_editor_is_split_into_arguments() {
+        // `EDITOR="code --wait"` is common, and passing it as one program name
+        // would fail to launch.
+        let cfg = Config::default();
+        // SAFETY: single-threaded test; no other thread reads the environment.
+        unsafe { std::env::set_var("VISUAL", "code --wait") };
+        assert_eq!(
+            cfg.editor_command(),
+            vec!["code".to_string(), "--wait".to_string()]
+        );
+        unsafe { std::env::remove_var("VISUAL") };
+    }
+
+    #[test]
+    fn the_default_differ_never_blocks_on_a_pager() {
+        // Output is captured rather than handed a terminal, so a pager would
+        // hang the TUI rather than show anything.
+        assert!(default_differ().contains(&"--paging=never".to_string()));
     }
 }
 

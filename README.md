@@ -53,9 +53,76 @@ Inputs group by their `original` flakeref, normalized:
 - GitHub owner/repo fold to lowercase, so `NixOS/nixpkgs` and `nixos/nixpkgs`
   are one identity (GitHub treats them as the same repo).
 - Distinct `ref`s stay separate — `nixpkgs-unstable` and `nixos-unstable` are
-  genuinely different branches and merging them would be wrong.
+  genuinely different branches, and converging them silently would change which
+  branch a project follows. Merging them is possible, but opt-in: see below.
 - `path` and `indirect` inputs are skipped; they are local or registry-relative
   and not shared artifacts.
+
+Node names are not attribute names. When two nodes would collide, Nix suffixes
+one (`nixpkgs_2`), so a flake that declares `nixpkgs` can have its own direct
+input stored under `nixpkgs_2`. The declared name is recovered by inverting the
+root node's `inputs` map, and it — not the node name — is what gets written to
+`flake.nix` and passed to `--override-input`.
+
+## Merging refs
+
+One repo is often declared under several refs across projects: `nixos/nixpkgs`,
+`@nixos-unstable`, `@nixpkgs-unstable`, `@nixos-24.11`. Each is its own identity,
+so none of them looks divergent, and no amount of revision syncing will bring
+them together — they are pinned to different branches by declaration.
+
+`m` marks a group, `M` merges every marked group onto the highlighted one. The
+merged group then behaves as a single input: one version list, one target, one
+plan. `m` on a merged group unmerges it. Nothing is merged by default and a merge
+is never persisted — it lasts for the session, and unmerging restores exactly
+what was there.
+
+Unlike revision syncing, this **edits `flake.nix`**, because that is where the
+ref is declared. For each project whose declared ref is not the canonical one:
+
+```
+edit  flake.nix: inputs.<name>.url = "github:owner/repo/<canonical-ref>"
+then  nix flake update <name> --override-input <name> github:owner/repo/<rev>
+```
+
+A pin on a non-canonical ref is included in the plan even when its revision
+already matches the target — the declaration is still wrong, and leaving it would
+drift straight back on the next `nix flake update`.
+
+### How flake.nix is edited
+
+Textually, and only the URL string literal — every other byte is left alone,
+including comments and formatting. Four layouts are recognized:
+
+```nix
+inputs = { nixpkgs.url = "..."; };        # attr inside an inputs block
+inputs.nixpkgs.url = "...";               # top-level dotted path
+inputs = { nixpkgs = { url = "..."; }; }; # nested attrset
+inputs = { nixpkgs = {                    # nested attrset, multi-line
+  url = "...";
+  inputs.foo.follows = "bar";
+}; };
+```
+
+Anything else is **refused, not guessed at**. The confirm screen lists the
+projects it will not rewrite before you approve the plan, and `e` opens one in
+your editor. Cases that are correctly refused include an input declared only as
+`nixpkgs.follows = "typelevel-nix/nixpkgs"` (there is no url to change) and a url
+built by interpolation (substring replacement cannot reason about it).
+
+Before writing, a `.nix.bak` is saved next to the original. After writing, the
+result is checked with `nix flake metadata`; if it no longer evaluates the
+original is restored byte for byte and the failure is reported. Backups are kept
+rather than cleaned up, so there is always something to diff against.
+
+## Seeing what happens
+
+Every `flake.nix` edit is shown as a real diff — computed from the actual file
+contents, not described — on the confirm screen *before* anything is written, and
+again in the results afterwards showing what actually landed. Diffs are piped
+through a configurable command (`delta` by default); if it is missing or fails,
+plain unified output is used, so a missing pretty-printer never means an edit
+goes unreviewed.
 
 ## Sync mechanism
 
@@ -88,9 +155,12 @@ inputs it has.
 | `Enter` | set highlighted version as this group's target |
 | `x` | exclude group from the plan |
 | `A` / `N` | select all groups at their suggested version / clear all |
+| `m` | mark group for merging, or unmerge a merged group |
+| `M` | merge marked groups onto the highlighted one |
+| `e` | open a `flake.nix` in your editor |
 | `a` | toggle divergent-only / all |
 | `g` | toggle rooted-only / include projects with no GC root |
-| `s` | stage plan (shows dry-run commands) |
+| `s` | stage plan (shows every command and every diff) |
 | `Enter` (staged) | execute |
 | `Esc` | cancel |
 | `q` | quit |
@@ -119,6 +189,14 @@ max_depth = 4
 # relative entries match the tail, on component boundaries — so `talks` ignores
 # `talks/` and everything under it, but not `talks-archive`.
 ignore = ["talks", "/Users/you/projects/scratch"]
+
+# Renders diffs of flake.nix edits; receives a unified diff on stdin.
+# Anything that reads a diff from stdin works. Set to [] for plain output.
+differ = ["delta", "--paging=never", "--color-only"]
+
+# Opens a flake.nix for manual editing, with the path appended.
+# Left at the default, $VISUAL / $EDITOR take precedence if set.
+editor = ["nvim"]
 ```
 
 `.git`, `.direnv` and `result` are skipped while scanning — `.direnv` in

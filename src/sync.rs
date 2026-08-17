@@ -21,6 +21,25 @@ pub struct Action {
     #[allow(dead_code)]
     pub from_version: String,
     pub target_version: String,
+    /// The declared ref this input is being moved *off*, when merging.
+    ///
+    /// `Some` means the project's `flake.nix` currently declares a different
+    /// flakeref than `identity`, and must be rewritten before the lockfile can
+    /// be resolved against the merged ref. `None` is a plain revision sync,
+    /// which never touches `flake.nix`.
+    pub from_identity: Option<Identity>,
+}
+
+impl Action {
+    /// Whether this action rewrites `flake.nix` as well as the lockfile.
+    pub fn changes_ref(&self) -> bool {
+        self.from_identity.is_some()
+    }
+
+    /// The url this action would write into `flake.nix`, if any.
+    pub fn target_url(&self) -> Option<String> {
+        self.changes_ref().then(|| self.identity.url())
+    }
 }
 
 /// The action bringing one pin to `target_version`.
@@ -30,10 +49,28 @@ pub struct Action {
 pub fn action_for(group: &Group, pin: &Pin, target_version: &str) -> Action {
     Action {
         project: pin.project.clone(),
-        input_name: pin.input_name.clone(),
+        input_name: pin.declared_name().to_string(),
         identity: group.identity.clone(),
         from_version: pin.version.clone(),
         target_version: target_version.to_string(),
+        from_identity: None,
+    }
+}
+
+/// The action moving one pin onto a merged identity's ref *and* revision.
+pub fn merge_action_for(
+    canonical: &Identity,
+    from: &Identity,
+    pin: &Pin,
+    target_version: &str,
+) -> Action {
+    Action {
+        project: pin.project.clone(),
+        input_name: pin.declared_name().to_string(),
+        identity: canonical.clone(),
+        from_version: pin.version.clone(),
+        target_version: target_version.to_string(),
+        from_identity: Some(from.clone()),
     }
 }
 
@@ -46,15 +83,29 @@ fn pinned_flakeref(identity: &Identity, version: &str) -> String {
     }
 }
 
-/// The command an action would run, for display in the TUI's dry-run view.
-pub fn command_line(action: &Action) -> String {
-    format!(
+/// The steps an action would perform, for display in the TUI's dry-run view.
+///
+/// A merge is two steps, and showing only the second would understate what is
+/// about to happen: the `flake.nix` rewrite is the part that edits a file the
+/// user maintains by hand.
+pub fn command_lines(action: &Action) -> Vec<String> {
+    let mut steps = Vec::new();
+    if let Some(url) = action.target_url() {
+        steps.push(format!(
+            "edit {}: inputs.{}.url = \"{}\"",
+            action.project.join("flake.nix").display(),
+            action.input_name,
+            url
+        ));
+    }
+    steps.push(format!(
         "nix flake update {} --override-input {} {} (in {})",
         action.input_name,
         action.input_name,
         pinned_flakeref(&action.identity, &action.target_version),
         action.project.display()
-    )
+    ));
+    steps
 }
 
 /// Execute one action.
@@ -62,6 +113,10 @@ pub fn command_line(action: &Action) -> String {
 /// Actions only ever name direct inputs — transitive ones are filtered out
 /// before planning, since `--override-input` cannot reach them. A failure here
 /// is a genuine Nix error and is surfaced verbatim.
+///
+/// When the action changes the declared ref, `edit` must already have been
+/// applied by the caller: the lockfile is resolved against whatever `flake.nix`
+/// says, so the file has to be correct before this runs.
 pub fn apply(action: &Action) -> Result<()> {
     let flake_nix = action.project.join("flake.nix");
     if !flake_nix.exists() {

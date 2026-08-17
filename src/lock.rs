@@ -9,7 +9,7 @@
 use crate::progress::Progress;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -127,6 +127,53 @@ impl Identity {
     }
 }
 
+/// What must match for two identities to be *mergeable*: the same upstream
+/// repository, ignoring which ref each project tracks.
+///
+/// Grouping deliberately keeps `nixpkgs-unstable` and `nixos-unstable` apart,
+/// because converging them silently would change which branch a project
+/// follows. Merging is the user saying "these are the same thing to me, move
+/// them onto one ref" — so it needs a coarser key than [`Identity`], and it
+/// stays opt-in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MergeKey {
+    pub kind: String,
+    pub owner: String,
+    pub repo: String,
+}
+
+impl Identity {
+    pub fn merge_key(&self) -> MergeKey {
+        MergeKey {
+            kind: self.kind.clone(),
+            owner: self.owner.clone(),
+            repo: self.repo.clone(),
+        }
+    }
+
+    /// The flakeref a project would declare to track this identity's ref.
+    ///
+    /// This is what gets written into `flake.nix` when merging: a branch-level
+    /// url, not a pinned revision. The revision is the lockfile's business, and
+    /// baking one into `flake.nix` would freeze the input permanently.
+    pub fn url(&self) -> String {
+        let base = if self.owner.is_empty() {
+            self.repo.clone()
+        } else {
+            format!("{}:{}/{}", self.kind, self.owner, self.repo)
+        };
+        if self.git_ref.is_empty() {
+            base
+        } else if self.owner.is_empty() {
+            // Non-github forges carry the ref as a query parameter.
+            let sep = if base.contains('?') { '&' } else { '?' };
+            format!("{base}{sep}ref={}", self.git_ref)
+        } else {
+            format!("{base}/{}", self.git_ref)
+        }
+    }
+}
+
 impl fmt::Display for Identity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.owner.is_empty() {
@@ -146,8 +193,18 @@ impl fmt::Display for Identity {
 pub struct Pin {
     /// Path to the project directory (the dir containing `flake.lock`).
     pub project: PathBuf,
-    /// The input's attribute name within that project's lockfile.
+    /// The input's node name within that project's lockfile.
+    ///
+    /// Not necessarily what the flake calls it: when two nodes would collide,
+    /// Nix suffixes them (`nixpkgs_2`), so a flake declaring `nixpkgs` can have
+    /// its own input stored under `nixpkgs_2`. See [`Pin::declared_name`].
     pub input_name: String,
+    /// The attribute name the project's own `flake.nix` declares, when this is
+    /// a direct input.
+    ///
+    /// This is the name to use against `flake.nix` and `--override-input`;
+    /// `input_name` is a lockfile-internal identifier and may differ.
+    pub declared_name: Option<String>,
     pub version: String,
     pub last_modified: Option<i64>,
     /// Whether the project's own `flake.nix` declares this input.
@@ -163,6 +220,14 @@ pub struct Pin {
 pub struct Group {
     pub identity: Identity,
     pub pins: Vec<Pin>,
+}
+
+impl Pin {
+    /// The name to use when addressing this input from outside the lockfile:
+    /// what `flake.nix` calls it, falling back to the node name.
+    pub fn declared_name(&self) -> &str {
+        self.declared_name.as_deref().unwrap_or(&self.input_name)
+    }
 }
 
 impl Group {
@@ -202,11 +267,19 @@ pub fn group(lock_paths: &[PathBuf]) -> (Vec<Group>, Vec<(PathBuf, anyhow::Error
         let project = lock_path.parent().unwrap_or(lock_path).to_path_buf();
 
         // The root node's inputs are exactly the flake's own declared inputs;
-        // every other node reached the lockfile through a dependency.
-        let direct_nodes: BTreeSet<&str> = lock
+        // every other node reached the lockfile through a dependency. The map
+        // is attribute-name → node-name, and the two differ whenever Nix had to
+        // disambiguate a collision (`nixpkgs` declared, `nixpkgs_2` stored), so
+        // it is inverted here to recover what `flake.nix` actually calls each.
+        let declared: BTreeMap<&str, &str> = lock
             .nodes
             .get(&lock.root)
-            .map(|r| r.inputs.values().filter_map(|e| e.node_name()).collect())
+            .map(|r| {
+                r.inputs
+                    .iter()
+                    .filter_map(|(attr, e)| e.node_name().map(|n| (n, attr.as_str())))
+                    .collect()
+            })
             .unwrap_or_default();
 
         for (name, node) in &lock.nodes {
@@ -221,12 +294,14 @@ pub fn group(lock_paths: &[PathBuf]) -> (Vec<Group>, Vec<(PathBuf, anyhow::Error
                 continue;
             };
 
+            let declared_name = declared.get(name.as_str()).map(|s| s.to_string());
             map.entry(identity).or_default().push(Pin {
                 project: project.clone(),
                 input_name: name.clone(),
                 version: version.to_string(),
                 last_modified: locked.last_modified,
-                direct: direct_nodes.contains(name.as_str()),
+                direct: declared_name.is_some(),
+                declared_name,
             });
         }
     }
@@ -300,11 +375,66 @@ mod tests {
         let g = Group {
             identity: Identity::from_ref(&gh("nixos", "nixpkgs", None)).unwrap(),
             pins: vec![
-                Pin { project: "/a".into(), input_name: "nixpkgs".into(), version: "same".into(), last_modified: Some(1), direct: true },
-                Pin { project: "/b".into(), input_name: "nixpkgs_2".into(), version: "other".into(), last_modified: Some(2), direct: false },
+                Pin { project: "/a".into(), input_name: "nixpkgs".into(), version: "same".into(), last_modified: Some(1), direct: true , declared_name: Some("nixpkgs".into()) },
+                Pin { project: "/b".into(), input_name: "nixpkgs_2".into(), version: "other".into(), last_modified: Some(2), direct: false , declared_name: None },
             ],
         };
         assert_eq!(g.transitive_count(), 1);
+    }
+
+    #[test]
+    fn a_renamed_node_reports_the_name_the_flake_declares() {
+        // Nix suffixes colliding node names, so a flake that declares `nixpkgs`
+        // can have its own direct input stored as `nixpkgs_2`. Addressing
+        // flake.nix or --override-input by the node name would miss it, and the
+        // node name is what the lockfile hands us.
+        let json = r#"{
+          "root": "root",
+          "nodes": {
+            "root": { "inputs": { "nixpkgs": "nixpkgs_2", "deploy-rs": "deploy-rs" } },
+            "nixpkgs": {
+              "original": { "type": "github", "owner": "nixos", "repo": "nixpkgs" },
+              "locked": { "rev": "aaa", "lastModified": 1 }
+            },
+            "nixpkgs_2": {
+              "original": { "type": "github", "owner": "nixos", "repo": "nixpkgs", "ref": "nixos-unstable" },
+              "locked": { "rev": "bbb", "lastModified": 2 }
+            },
+            "deploy-rs": {
+              "original": { "type": "github", "owner": "serokell", "repo": "deploy-rs" },
+              "locked": { "rev": "ccc", "lastModified": 3 }
+            }
+          }
+        }"#;
+        let dir = std::env::temp_dir().join("flake-syncer-renamed-node-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("flake.lock"), json).unwrap();
+
+        let (groups, errors) = group(&[dir.join("flake.lock")]);
+        assert!(errors.is_empty());
+
+        let renamed = groups
+            .iter()
+            .flat_map(|g| &g.pins)
+            .find(|p| p.input_name == "nixpkgs_2")
+            .expect("nixpkgs_2 should be recorded");
+        assert!(renamed.direct, "it is the flake's own input, despite the suffix");
+        assert_eq!(
+            renamed.declared_name(),
+            "nixpkgs",
+            "flake.nix and --override-input must be addressed by the declared name"
+        );
+
+        // The unreferenced `nixpkgs` node came in through a dependency.
+        let transitive = groups
+            .iter()
+            .flat_map(|g| &g.pins)
+            .find(|p| p.input_name == "nixpkgs")
+            .expect("nixpkgs should be recorded");
+        assert!(!transitive.direct);
+        assert_eq!(transitive.declared_name(), "nixpkgs");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -330,7 +460,7 @@ mod tests {
         }"#;
         let lock: LockFile = serde_json::from_str(json).unwrap();
         let root = lock.nodes.get(&lock.root).unwrap();
-        let direct: BTreeSet<&str> = root
+        let direct: std::collections::BTreeSet<&str> = root
             .inputs
             .values()
             .filter_map(|e| e.node_name())
