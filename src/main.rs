@@ -15,6 +15,7 @@ use crossterm::execute;
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
 use std::io::stdout;
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use app::{App, Mode};
@@ -58,7 +59,20 @@ fn main() -> Result<()> {
     // `--all-projects` drops the GC-root requirement in both modes.
     let rooted_only = !std::env::args().any(|a| a == "--all-projects");
 
-    let roots = store::scan_roots();
+    // The printing modes need every size before they can print a total, so they
+    // size up front with a progress bar. The TUI does not: it opens on the root
+    // set and lets sizes stream in, since which paths are rooted — and so which
+    // projects are in scope — is already known without them.
+    let print_only = roots_only || report_only;
+    let roots = if print_only {
+        store::scan_roots()
+    } else {
+        store::scan_root_set()
+    };
+
+    let sizing_paths: Vec<std::path::PathBuf> =
+        if print_only { Vec::new() } else { roots.keys().cloned().collect() };
+
     let mut app = App::new(groups, roots, parse_errors, cfg);
     app.rooted_only = rooted_only;
     app.roots_hide_process = !with_process;
@@ -69,7 +83,10 @@ fn main() -> Result<()> {
     if report_only {
         return print_report(&app, locks.len());
     }
-    run_tui(app)
+
+    app.begin_sizing(sizing_paths.len());
+    let sizes = store::size_paths(sizing_paths);
+    run_tui(app, sizes)
 }
 
 /// The reverse root index, printed and exited.
@@ -196,13 +213,13 @@ fn print_report(app: &App, lock_count: usize) -> Result<()> {
     Ok(())
 }
 
-fn run_tui(mut app: App) -> Result<()> {
+fn run_tui(mut app: App, sizes: Receiver<(std::path::PathBuf, u64)>) -> Result<()> {
     enable_raw_mode()?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen)?;
     let mut term = Terminal::new(CrosstermBackend::new(out))?;
 
-    let result = event_loop(&mut term, &mut app);
+    let result = event_loop(&mut term, &mut app, &sizes);
 
     disable_raw_mode()?;
     execute!(term.backend_mut(), LeaveAlternateScreen)?;
@@ -212,10 +229,28 @@ fn run_tui(mut app: App) -> Result<()> {
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
-fn event_loop(term: &mut Term, app: &mut App) -> Result<()> {
+/// Fold every size measured since the last frame into `app`.
+///
+/// Drained rather than taken one at a time so a fast sizing pass cannot outrun
+/// the redraw rate and leave the totals lagging behind the screen.
+fn drain_sizes(app: &mut App, sizes: &Receiver<(std::path::PathBuf, u64)>) {
+    for (path, size) in sizes.try_iter() {
+        app.apply_size(&path, size);
+    }
+}
+
+fn event_loop(
+    term: &mut Term,
+    app: &mut App,
+    sizes: &Receiver<(std::path::PathBuf, u64)>,
+) -> Result<()> {
     loop {
+        drain_sizes(app, sizes);
         term.draw(|f| ui::draw(f, app))?;
 
+        // The poll timeout doubles as the sizing refresh rate: with no keys
+        // pressed this wakes 5x a second, folds in whatever has been measured
+        // and repaints, so the numbers climb visibly without a dedicated tick.
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }

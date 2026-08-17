@@ -88,7 +88,32 @@ pub fn is_process_root(root: &str) -> bool {
     root.starts_with('{') && root.ends_with('}')
 }
 
-/// Ask the Nix daemon for the authoritative GC root set.
+/// Ask the Nix daemon for the authoritative GC root set, sizes included.
+///
+/// The blocking form, for `--report` and `--roots`: both print byte totals and
+/// exit, so there is nothing to defer sizing for. The TUI instead calls
+/// `scan_root_set` and sizes in the background — see `size_paths`.
+pub fn scan_roots() -> BTreeMap<PathBuf, RootedPath> {
+    let mut roots = scan_root_set();
+    let paths: Vec<PathBuf> = roots.keys().cloned().collect();
+
+    // Sizing dominates the scan (it walks every file of every rooted source),
+    // so each unique store path is measured once, in parallel. This is also the
+    // one phase slow enough to need an ETA, and the count is known up front, so
+    // the estimate is a real one.
+    let sizing = Progress::new("sizing paths", Some(paths.len()));
+    let sizes = measure(&paths, |_, _| sizing.advance(1));
+    sizing.finish();
+
+    for (path, size) in sizes {
+        if let Some(r) = roots.get_mut(&path) {
+            r.size_bytes = size;
+        }
+    }
+    roots
+}
+
+/// Which store paths are rooted, and by what — with every `size_bytes` still 0.
 ///
 /// This must come from `nix-store --gc --print-roots` rather than a walk of
 /// `/nix/var/nix/gcroots/auto`: profiles, `result` symlinks and running
@@ -103,9 +128,7 @@ pub fn is_process_root(root: &str) -> bool {
 ///
 /// Returns an empty map if Nix is unavailable, which degrades to "no savings
 /// claimed" rather than to an overstatement.
-pub fn scan_roots() -> BTreeMap<PathBuf, RootedPath> {
-    use rayon::prelude::*;
-
+pub fn scan_root_set() -> BTreeMap<PathBuf, RootedPath> {
     let links = Progress::new("gc roots", None);
 
     let output = std::process::Command::new("nix-store")
@@ -153,32 +176,57 @@ pub fn scan_roots() -> BTreeMap<PathBuf, RootedPath> {
         .into_iter()
         .collect();
 
-    // Sizing dominates the scan (it walks every file of every rooted source),
-    // so each unique store path is measured once, in parallel. This is also the
-    // one phase slow enough to need an ETA, and the count is known up front, so
-    // the estimate is a real one.
-    let sizing = Progress::new("sizing paths", Some(all_paths.len()));
-    let sizes: Vec<(PathBuf, u64)> = all_paths
-        .into_par_iter()
-        .map(|p| {
-            let size = dir_size(&p);
-            sizing.advance(1);
-            (p, size)
-        })
-        .collect();
-    sizing.finish();
-
-    sizes
+    all_paths
         .into_iter()
-        .map(|(path, size_bytes)| {
+        .map(|path| {
             let retained_by = retainers.get(&path).cloned().unwrap_or_default();
             let external_roots = external.get(&path).cloned().unwrap_or_default();
             (
                 path.clone(),
-                RootedPath { store_path: path, retained_by, external_roots, size_bytes },
+                // Unmeasured. Callers either size these themselves (`scan_roots`)
+                // or fill them in as `size_paths` reports each one.
+                RootedPath { store_path: path, retained_by, external_roots, size_bytes: 0 },
             )
         })
         .collect()
+}
+
+/// Measure every path, reporting each result to `report` as it lands.
+///
+/// Shared by the blocking and streaming callers so there is one definition of
+/// how a store path is measured and how the work is parallelised.
+fn measure(paths: &[PathBuf], report: impl Fn(&Path, u64) + Send + Sync) -> Vec<(PathBuf, u64)> {
+    use rayon::prelude::*;
+
+    paths
+        .par_iter()
+        .map(|p| {
+            let size = dir_size(p);
+            report(p, size);
+            (p.clone(), size)
+        })
+        .collect()
+}
+
+/// Size `paths` on a background thread, sending each result as it is measured.
+///
+/// Split from the root set because sizing is the slow phase by an order of
+/// magnitude while contributing nothing to *which* paths are rooted or which
+/// projects hold them — so the TUI can open on a complete, correctly filtered
+/// group list and let the byte figures fill in behind it.
+///
+/// Quitting mid-scan drops the receiver, after which every `send` fails
+/// harmlessly and the thread runs to completion unread. Detached rather than
+/// joined for exactly that reason: the process is on its way out, and waiting on
+/// a directory walk nobody will look at would only delay the exit.
+pub fn size_paths(paths: Vec<PathBuf>) -> std::sync::mpsc::Receiver<(PathBuf, u64)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        measure(&paths, |path, size| {
+            let _ = tx.send((path.to_path_buf(), size));
+        });
+    });
+    rx
 }
 
 /// Apparent size of a store path, following no symlinks.

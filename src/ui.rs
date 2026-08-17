@@ -32,6 +32,61 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_footer(f, chunks[2], app);
 }
 
+/// A byte figure, marked with `+` while sizing is still running.
+///
+/// Every unmeasured path can only add to the total, so a figure shown mid-scan
+/// is a lower bound. The marker is what keeps it from reading as final — this
+/// tool exists to not overstate savings, and an understated number presented as
+/// settled is the same class of error.
+fn provisional_bytes(app: &App, bytes: u64) -> String {
+    if app.sizes_provisional() {
+        format!("{}+", human_bytes(bytes))
+    } else {
+        human_bytes(bytes)
+    }
+}
+
+/// One row's size, or a placeholder while that path is still being walked.
+///
+/// An unmeasured path holds 0 bytes as far as the struct is concerned, and
+/// rendering that as `0 B` would claim an empty store path — indistinguishable
+/// from a real one, and wrong. The placeholder says which it is.
+fn row_size(app: &App, row: &crate::store::RootRow) -> String {
+    if app.is_measured(&row.store_path) {
+        human_bytes(row.size_bytes)
+    } else {
+        "—".to_string()
+    }
+}
+
+/// The sizing count, as a span to place next to the figures it qualifies.
+///
+/// Spelled out so the `+` marker has a visible explanation rather than being a
+/// symbol the user has to guess at — which means it has to be positioned where a
+/// narrow terminal will not truncate it before the thing it explains.
+fn sizing_span(app: &App) -> Option<Span<'static>> {
+    let s = app.sizing?;
+    Some(Span::styled(
+        format!("sizing {}/{}", s.done, s.total),
+        Style::new().fg(Color::DarkGray),
+    ))
+}
+
+/// Append the sizing count to a header line that has nothing outranking it.
+///
+/// Where a header does carry lower-priority trailing spans, the count is placed
+/// inline instead — a narrow terminal must not truncate the explanation of `+`
+/// while keeping the `+` itself.
+fn with_sizing_note<'a>(app: &App, line: Line<'a>) -> Line<'a> {
+    let Some(note) = sizing_span(app) else {
+        return line;
+    };
+    let mut spans = line.spans;
+    spans.push(Span::raw("  "));
+    spans.push(note);
+    Line::from(spans)
+}
+
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     // Mid-run the browse-mode counts describe a state the user has already left,
     // and `estimated_savings` is about a plan that is currently being applied.
@@ -69,7 +124,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(format!("{} path(s)", rows.len())),
             Span::raw("  "),
             Span::styled(
-                format!("{} held", human_bytes(app.roots_total_bytes())),
+                format!("{} held", provisional_bytes(app, app.roots_total_bytes())),
                 Style::new().fg(Color::DarkGray),
             ),
             Span::raw("  "),
@@ -78,6 +133,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                 Style::new().fg(Color::Green),
             ),
         ]);
+        // Nothing here outranks the sizing count, so it goes on the end.
+        let line = with_sizing_note(app, line);
         f.render_widget(
             Paragraph::new(line).block(Block::default().borders(Borders::ALL)),
             area,
@@ -86,7 +143,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let (bytes, paths) = app.estimated_savings();
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled("flake-syncer", Style::new().bold().fg(Color::Cyan)),
         Span::raw("  "),
         Span::raw(format!("{} groups", app.groups.len())),
@@ -102,14 +159,21 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw("  "),
         Span::styled(
-            format!("~{} reclaimable ({} paths)", human_bytes(bytes), paths),
+            format!("~{} reclaimable ({} paths)", provisional_bytes(app, bytes), paths),
             Style::new().fg(Color::Green),
         ),
         Span::raw("  "),
-        // The rooted-only filter hides whole projects. Saying so here is what
-        // makes `g` discoverable — otherwise the counts look unexplained.
-        scope_span(app),
-    ]);
+    ];
+    // Directly after the figure it qualifies, so a narrow header truncates the
+    // scope span (which explains itself) rather than the text explaining `+`.
+    if let Some(note) = sizing_span(app) {
+        spans.push(note);
+        spans.push(Span::raw("  "));
+    }
+    // The rooted-only filter hides whole projects. Saying so here is what
+    // makes `g` discoverable — otherwise the counts look unexplained.
+    spans.push(scope_span(app));
+    let line = Line::from(spans);
     // Unreadable lockfiles are surfaced rather than silently dropped: they make
     // the divergence counts an undercount.
     let line = if app.parse_errors.is_empty() {
@@ -831,7 +895,7 @@ fn draw_roots(f: &mut Frame, area: Rect, app: &App) {
             Line::from(Span::styled(
                 format!(
                     "{marker} {:>9}  {:>2}  {name}",
-                    human_bytes(r.size_bytes),
+                    row_size(app, r),
                     r.retainer_count(),
                 ),
                 style,
@@ -862,7 +926,11 @@ fn draw_root_detail(f: &mut Frame, area: Rect, app: &App) {
             row.store_path.display().to_string(),
             Style::new().fg(Color::Cyan),
         )),
-        Line::from(format!("{} across {} root(s)", human_bytes(row.size_bytes), row.retainer_count())),
+        Line::from(format!(
+            "{} across {} root(s)",
+            row_size(app, &row),
+            row.retainer_count()
+        )),
         Line::from(""),
     ];
 
@@ -1038,6 +1106,60 @@ mod render_tests {
         app.running = Some(r);
         app.mode = Mode::Running;
         app
+    }
+
+    /// The roots view, mid-sizing: one path measured, two still pending.
+    fn part_sized_roots_app() -> App {
+        let mut app = crate::app::test_support::app_with_roots();
+        for r in app.roots.values_mut() {
+            r.size_bytes = 0;
+        }
+        app.begin_sizing(3);
+        app.apply_size(
+            &std::path::PathBuf::from("/nix/store/bbb-utils-source"),
+            2_000_000,
+        );
+        app.open_roots();
+        app
+    }
+
+    #[test]
+    fn a_growing_total_is_marked_as_still_sizing() {
+        let out = render(&part_sized_roots_app(), 110, 24);
+        // The bytes so far, flagged as a lower bound...
+        assert!(out.contains("1.9 MiB+ held"), "{out}");
+        // ...and the count that explains the flag.
+        assert!(out.contains("sizing 1/3"), "{out}");
+    }
+
+    #[test]
+    fn an_unmeasured_path_renders_as_pending_not_as_empty() {
+        let out = render(&part_sized_roots_app(), 110, 24);
+        // The measured row shows its size; the unmeasured ones must not claim
+        // to be empty store paths.
+        assert!(out.contains("1.9 MiB"), "{out}");
+        assert!(!out.contains("0 B"), "{out}");
+        assert!(out.contains("—"), "{out}");
+    }
+
+    #[test]
+    fn a_finished_scan_leaves_no_provisional_marker() {
+        let app = roots_app();
+        let out = render(&app, 110, 24);
+        assert!(!out.contains("sizing"), "{out}");
+        assert!(!out.contains("MiB+"), "{out}");
+        assert!(out.contains("11.0 MiB held"), "{out}");
+    }
+
+    #[test]
+    fn the_browse_header_marks_a_provisional_savings_figure() {
+        let mut app = crate::app::test_support::app_for_render();
+        app.begin_sizing(4);
+        let out = render(&app, 110, 24);
+        assert!(out.contains("~0 B+ reclaimable"), "{out}");
+        // The count sits inside the width the scope span used to push it past:
+        // a `+` whose explanation is truncated away is worse than no marker.
+        assert!(out.contains("sizing 0/4"), "{out}");
     }
 
     #[test]

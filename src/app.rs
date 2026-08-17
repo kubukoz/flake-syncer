@@ -282,6 +282,44 @@ pub struct App {
     /// Stored rather than hardcoded to `Browse` so the view can be opened from
     /// the report screen without stranding the user somewhere they weren't.
     roots_return_to: Mode,
+
+    /// Background sizing progress, `None` once every path is measured.
+    ///
+    /// While this is `Some`, every byte figure in the UI is a lower bound — the
+    /// unmeasured paths can only add to it — so the views that show one mark it
+    /// as still growing. This tool's whole point is not overstating savings; an
+    /// understated one still must not read as final.
+    pub sizing: Option<Sizing>,
+
+    /// Paths whose size is known, while sizing is still running.
+    ///
+    /// A `size_bytes` of 0 cannot distinguish "not measured yet" from "measured,
+    /// and genuinely empty", so per-row rendering asks this instead of guessing
+    /// from the number. Emptied once every path is in, since by then the answer
+    /// is always yes.
+    measured: BTreeSet<PathBuf>,
+
+    /// Row order for the roots view, frozen when it was opened.
+    ///
+    /// The list is ranked by size, so sizes arriving while the user reads it
+    /// would reorder rows under the cursor. Holding the order from entry keeps
+    /// the cursor pointing at the path it was pointing at, and the numbers still
+    /// fill in where they sit.
+    roots_order: Vec<PathBuf>,
+}
+
+/// How far the background sizing pass has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sizing {
+    pub done: usize,
+    pub total: usize,
+}
+
+impl Sizing {
+    /// Whether every path has been measured, so byte figures are now final.
+    pub fn complete(&self) -> bool {
+        self.done >= self.total
+    }
 }
 
 impl App {
@@ -317,18 +355,78 @@ impl App {
             roots_freeable_only: false,
             roots_hide_process: true,
             roots_return_to: Mode::Browse,
+            sizing: None,
+            measured: BTreeSet::new(),
+            roots_order: Vec::new(),
         };
         app.status = "nothing selected — Enter picks a version, A selects all".into();
         app
     }
 
+    /// Declare that sizing is running in the background over `total` paths.
+    pub fn begin_sizing(&mut self, total: usize) {
+        // Nothing to wait for: leaving this `None` keeps every byte figure
+        // unqualified, which is correct when there was no work to do.
+        if total == 0 {
+            self.sizing = None;
+            return;
+        }
+        self.sizing = Some(Sizing { done: 0, total });
+    }
+
+    /// Record one measured store path.
+    ///
+    /// A path absent from `roots` is counted but not stored: the root set is
+    /// fixed at startup, so an unknown path here would mean the two phases
+    /// disagreed, and silently inserting a size-only entry would put a row with
+    /// no retainers in the roots view.
+    pub fn apply_size(&mut self, path: &PathBuf, size: u64) {
+        if let Some(r) = self.roots.get_mut(path) {
+            r.size_bytes = size;
+            self.measured.insert(path.clone());
+        }
+        if let Some(s) = &mut self.sizing {
+            s.done += 1;
+            if s.complete() {
+                self.sizing = None;
+                // Everything is known from here on, so the set has nothing left
+                // to distinguish and need not be carried.
+                self.measured = BTreeSet::new();
+            }
+        }
+    }
+
+    /// Whether byte figures are still growing.
+    pub fn sizes_provisional(&self) -> bool {
+        self.sizing.is_some()
+    }
+
+    /// Whether this path's size is known yet.
+    pub fn is_measured(&self, path: &PathBuf) -> bool {
+        self.sizing.is_none() || self.measured.contains(path)
+    }
+
     /// Rows for the roots view, honouring the freeable-only filter.
     ///
-    /// Recomputed per call rather than cached: `roots` is fixed for the life of
-    /// the process (a rescan means a restart), so there is no staleness to
-    /// manage, and the row count is bounded by the store paths actually rooted.
+    /// Recomputed per call rather than cached: the row set is fixed for the life
+    /// of the process (a rescan means a restart) and only the sizes within it
+    /// change, so there is no staleness to manage, and the row count is bounded
+    /// by the store paths actually rooted.
     pub fn root_rows(&self) -> Vec<store::RootRow> {
         let mut rows = store::root_rows(&self.roots);
+
+        // Restore the order the view was opened with, so incoming sizes cannot
+        // move rows under the cursor. Paths missing from the snapshot sort last;
+        // there should be none, since the root set never changes after startup.
+        if !self.roots_order.is_empty() {
+            let rank: BTreeMap<&PathBuf, usize> = self
+                .roots_order
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p, i))
+                .collect();
+            rows.sort_by_key(|r| rank.get(&r.store_path).copied().unwrap_or(usize::MAX));
+        }
 
         // Applied before any process roots are cleared: clearing them first
         // would make `freeable()` true for a path a process really does pin,
@@ -356,9 +454,18 @@ impl App {
         self.roots_return_to = self.mode;
         self.mode = Mode::Roots;
         self.roots_idx = 0;
+        // Freeze the ranking as it stands now, over the whole root set so the
+        // filters reorder nothing when they narrow it. Cleared on the way out,
+        // so a later re-entry re-ranks by whatever sizes are known by then.
+        self.roots_order = store::root_rows(&self.roots)
+            .into_iter()
+            .map(|r| r.store_path)
+            .collect();
         let rows = self.root_rows();
         self.status = if rows.is_empty() {
             "no GC roots found — is nix available?".into()
+        } else if let Some(s) = self.sizing {
+            format!("{} rooted store path(s) — sizing {}/{}", rows.len(), s.done, s.total)
         } else {
             format!("{} rooted store path(s)", rows.len())
         };
@@ -367,6 +474,7 @@ impl App {
     /// Leave the roots view for wherever it was opened from.
     pub fn close_roots(&mut self) {
         self.mode = self.roots_return_to;
+        self.roots_order.clear();
         self.status.clear();
     }
 
@@ -1550,6 +1658,166 @@ mod tests {
         };
         assert_eq!(row.count(), 3);
         assert_eq!(row.project_names(), vec!["foo".to_string(), "bar".to_string()]);
+    }
+
+    /// An app whose roots are known but entirely unmeasured, as the TUI starts.
+    fn unsized_app() -> App {
+        let mut app = test_support::app_with_roots();
+        for r in app.roots.values_mut() {
+            r.size_bytes = 0;
+        }
+        let n = app.roots.len();
+        app.begin_sizing(n);
+        app
+    }
+
+    fn store_path(name: &str) -> PathBuf {
+        PathBuf::from(format!("/nix/store/{name}"))
+    }
+
+    #[test]
+    fn sizes_are_provisional_until_every_path_is_measured() {
+        let mut app = unsized_app();
+        assert!(app.sizes_provisional());
+
+        app.apply_size(&store_path("aaa-nixpkgs-source"), 9_000_000);
+        app.apply_size(&store_path("bbb-utils-source"), 2_000_000);
+        // One path outstanding, so the total can still grow.
+        assert!(app.sizes_provisional());
+
+        app.apply_size(&store_path("ccc-jdk"), 500_000);
+        assert!(!app.sizes_provisional());
+    }
+
+    #[test]
+    fn a_measured_size_lands_in_the_totals() {
+        let mut app = unsized_app();
+        assert_eq!(app.roots_total_bytes(), 0);
+
+        app.apply_size(&store_path("aaa-nixpkgs-source"), 9_000_000);
+        assert_eq!(app.roots_total_bytes(), 9_000_000);
+    }
+
+    #[test]
+    fn an_unmeasured_path_is_distinguishable_from_an_empty_one() {
+        // Both hold 0 bytes in the struct; only the measured one may be
+        // rendered as a real size.
+        let mut app = unsized_app();
+        assert!(!app.is_measured(&store_path("aaa-nixpkgs-source")));
+
+        app.apply_size(&store_path("aaa-nixpkgs-source"), 0);
+        assert!(app.is_measured(&store_path("aaa-nixpkgs-source")));
+        assert!(!app.is_measured(&store_path("bbb-utils-source")));
+    }
+
+    #[test]
+    fn every_path_is_measured_once_sizing_completes() {
+        let mut app = unsized_app();
+        for path in ["aaa-nixpkgs-source", "bbb-utils-source", "ccc-jdk"] {
+            app.apply_size(&store_path(path), 1);
+        }
+        // The set is dropped when it stops carrying information, so this must
+        // fall back to "sizing is done, so yes" rather than to a lookup.
+        assert!(app.is_measured(&store_path("aaa-nixpkgs-source")));
+    }
+
+    #[test]
+    fn nothing_to_size_leaves_figures_unqualified() {
+        let mut app = test_support::app_with_roots();
+        app.begin_sizing(0);
+        assert!(!app.sizes_provisional());
+    }
+
+    #[test]
+    fn a_size_for_an_unknown_path_is_counted_but_not_stored() {
+        // The two phases read the same root set, so this should not happen; if
+        // it does, the path must not appear as a retainer-less row.
+        let mut app = unsized_app();
+        let before = app.roots.len();
+
+        app.apply_size(&store_path("zzz-not-rooted"), 1_000);
+
+        assert_eq!(app.roots.len(), before);
+        assert_eq!(app.roots_total_bytes(), 0);
+        // Still counted, so a stray result cannot leave sizing stuck at 2/3.
+        assert_eq!(app.sizing.map(|s| s.done), Some(1));
+    }
+
+    #[test]
+    fn incoming_sizes_do_not_reorder_the_open_roots_view() {
+        let mut app = unsized_app();
+        // Measure the small one first, so it ranks top when the view opens.
+        app.apply_size(&store_path("ccc-jdk"), 500_000);
+        app.open_roots();
+
+        // ccc-jdk is process-pinned and hidden by default, so it is measured
+        // here only to make the *unmeasured* pair's entry order observable.
+        app.toggle_roots_process();
+        let before: Vec<PathBuf> =
+            app.root_rows().into_iter().map(|r| r.store_path).collect();
+        assert_eq!(before[0], store_path("ccc-jdk"));
+
+        // A far larger path arrives; it belongs at the top by size, but moving
+        // it there would drag every row under the user's cursor.
+        app.apply_size(&store_path("aaa-nixpkgs-source"), 9_000_000);
+
+        let after: Vec<PathBuf> =
+            app.root_rows().into_iter().map(|r| r.store_path).collect();
+        assert_eq!(before, after);
+        // The number itself did update in place, where the row already sat.
+        let aaa = after.iter().position(|p| p == &store_path("aaa-nixpkgs-source"));
+        assert_eq!(app.root_rows()[aaa.unwrap()].size_bytes, 9_000_000);
+    }
+
+    #[test]
+    fn reopening_the_roots_view_reranks_by_the_sizes_known_then() {
+        let mut app = unsized_app();
+        app.apply_size(&store_path("ccc-jdk"), 500_000);
+        app.open_roots();
+        app.apply_size(&store_path("aaa-nixpkgs-source"), 9_000_000);
+        app.close_roots();
+
+        app.open_roots();
+        assert_eq!(app.root_rows()[0].store_path, store_path("aaa-nixpkgs-source"));
+    }
+
+    #[test]
+    fn the_frozen_order_survives_the_roots_filters() {
+        let mut app = unsized_app();
+        app.apply_size(&store_path("ccc-jdk"), 500_000);
+        app.open_roots();
+        app.apply_size(&store_path("aaa-nixpkgs-source"), 9_000_000);
+        app.apply_size(&store_path("bbb-utils-source"), 2_000_000);
+
+        // ccc-jdk is externally pinned, so the filter drops it; the two that
+        // remain must keep their entry order rather than re-sorting by size.
+        app.toggle_roots_filter();
+        let rows: Vec<PathBuf> = app.root_rows().into_iter().map(|r| r.store_path).collect();
+        assert_eq!(
+            rows,
+            [store_path("aaa-nixpkgs-source"), store_path("bbb-utils-source")]
+        );
+    }
+
+    #[test]
+    fn savings_grow_as_sizes_arrive() {
+        let mut app = unsized_app();
+        // Both projects pinning bbb are migrating, so it is reclaimable once
+        // its size is known — and worth nothing before that. aaa qualifies too
+        // (myapp is its only retainer); ccc never does, being externally pinned.
+        let mut migrating = BTreeSet::new();
+        migrating.insert(PathBuf::from("/Users/k/projects/myapp"));
+        migrating.insert(PathBuf::from("/Users/k/dev/other"));
+
+        // The path count is right from the start — only the bytes are pending,
+        // which is exactly why the figure reads as a lower bound and not as nil.
+        assert_eq!(store::reclaimable(&app.roots, &migrating), (0, 2));
+
+        app.apply_size(&store_path("bbb-utils-source"), 2_000_000);
+        assert_eq!(store::reclaimable(&app.roots, &migrating), (2_000_000, 2));
+
+        app.apply_size(&store_path("aaa-nixpkgs-source"), 9_000_000);
+        assert_eq!(store::reclaimable(&app.roots, &migrating), (11_000_000, 2));
     }
 }
 
